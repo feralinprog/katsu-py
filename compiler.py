@@ -718,8 +718,9 @@ class Compiler:
             result_reg = self.compile_expr(
                 self.ir, expr, tail_position=True, currently_inlining=False
             )
-            if result_reg:
-                self.add_ir_op(self.ir, ReturnOp(value=result_reg, span=expr.span))
+            if not result_reg:
+                result_reg = self.add_ir_op(self.ir, LiteralOp(dst=self.allocate_virtual_reg(), value=NullValue(), span=expr.span))
+            self.add_ir_op(self.ir, ReturnOp(value=result_reg, span=expr.span))
             print_ir_block(self.ir, depth=1)
 
             any_change = True
@@ -799,16 +800,11 @@ class Compiler:
                 any_change = False
                 iteration += 1
                 optimize_cfg("simplifying control flow graph", self.simplify_control_flow_graph)
-                optimize_cfg("eliminating unreachable code", self.cfg_eliminate_unreachable_code)
+                optimize_cfg("eliminating dead/unreachable code", self.cfg_eliminate_dead_code)
                 optimize_cfg("inferring types", self.cfg_infer_types)
                 print_basic_blocks(self.basic_blocks)
                 optimize_cfg("simplifying multimethod dispatches", self.cfg_simplify_dispatches)
-                # This includes:
-                # * applying type knowledge to simplify multimethod dispatches
-                # * deleting UnreachableOp instances (and the registers they "write" to)
-                # * replacing single-source phi nodes with copy ops
-                # TODO: optimize_cfg("eliminating dead code", self.cfg_eliminate_dead_code)
-                # TODO: optimize_cfg("propagating copies", self.cfg_propagate_copies)
+                optimize_cfg("propagating copies", self.cfg_propagate_copies)
                 for block in self.basic_blocks:
                     block.types = None
 
@@ -1998,7 +1994,10 @@ class Compiler:
             for block in self.basic_blocks:
                 if block.is_entry:
                     continue
-                reachable_preds = block.incoming & reachable_blocks
+                if block in reachable_blocks:
+                    reachable_preds = block.incoming & reachable_blocks
+                else:
+                    reachable_preds = block.incoming
                 if reachable_preds:
                     new_dominators = set([block]) | set.intersection(
                         *[pred.dominators for pred in reachable_preds]
@@ -2021,11 +2020,14 @@ class Compiler:
                     queue.append(succ)
         return reachable_blocks
 
-    def cfg_eliminate_unreachable_code(self) -> bool:
-        # A block is unreachable if there is no path from the entry block to it.
-        # First we visit blocks from the entry block to determine reachability;
-        # then we collect the list of registers to 'delete' (due to unreachable assignments),
-        # and propagate their deletion through the rest of the blocks.
+    def cfg_eliminate_dead_code(self) -> bool:
+        # This function:
+        # * Deletes unreachable blocks (and makes sure to delete from the rest of the reachable
+        #   blocks any use of registers which were generated from unreachable blocks).
+        # * Deletes any ops whose output is not a source register of any reachable block.
+        #   (Caveat: for ops with side effects, just delete the destination register instead of
+        #   the whole op.)
+
         reachable_blocks = self.find_reachable_blocks()
         unreachable_blocks = set(self.basic_blocks) - reachable_blocks
         # Sanity check: no reachable block should have an outgoing edge to an unreachable block.
@@ -2039,6 +2041,11 @@ class Compiler:
                 succ.incoming.remove(block)
         for block in unreachable_blocks:
             self.basic_blocks.remove(block)
+
+        used_regs = set()
+        for block in reachable_blocks:
+            for op in block.ops:
+                used_regs |= basic_ir_op_reg_srcs(op)
 
         unassigned_regs = set()
         for block in unreachable_blocks:
@@ -2063,35 +2070,50 @@ class Compiler:
                     raise AssertionError("unreachable op shouldn't exist in reachable code")
                 elif isinstance(op, CopyOp):
                     assert op.src not in unassigned_regs
-                    block.ops.append(op)
+                    if op.dst in used_regs:
+                        block.ops.append(op)
                 elif isinstance(op, BasicBlockPhiOp):
                     assert not (set(reg for reg, _ in op.srcs) <= unassigned_regs)
-                    op.srcs = [
-                        (reg, src_block) for reg, src_block in op.srcs if reg not in unassigned_regs
-                    ]
-                    if len(op.srcs) == 1:
-                        # Convert to a direct assignment.
-                        reg, _ = op.srcs[0]
-                        block.ops.append(CopyOp(dst=op.dst, src=reg, span=op.span))
-                    else:
-                        block.ops.append(op)
+                    if op.dst in used_regs:
+                        op.srcs = [
+                            (reg, src_block) for reg, src_block in op.srcs if reg not in unassigned_regs
+                        ]
+                        if len(op.srcs) == 1:
+                            # Convert to a direct assignment.
+                            reg, _ = op.srcs[0]
+                            block.ops.append(CopyOp(dst=op.dst, src=reg, span=op.span))
+                        else:
+                            block.ops.append(op)
                 elif isinstance(op, LiteralOp):
-                    block.ops.append(op)
+                    if op.dst in used_regs:
+                        block.ops.append(op)
                 elif isinstance(op, BaseInvokeOp):
                     assert not (set(op.call_args) & unassigned_regs)
+                    if op.dst not in used_regs:
+                        # Can't just delete the op, since this op has side effects.
+                        op.dst = None
                     block.ops.append(op)
                 elif isinstance(op, ClosureOp):
-                    block.ops.append(op)
+                    if op.dst in used_regs:
+                        block.ops.append(op)
                 elif isinstance(op, SlotLookupOp):
+                    if op.dst not in used_regs:
+                        # Can't just delete the op, since this op has side effects.
+                        op.dst = None
                     block.ops.append(op)
                 elif isinstance(op, VectorOp):
                     assert not (set(op.components) & unassigned_regs)
-                    block.ops.append(op)
+                    if op.dst in used_regs:
+                        block.ops.append(op)
                 elif isinstance(op, TupleOp):
                     assert not (set(op.components) & unassigned_regs)
-                    block.ops.append(op)
+                    if op.dst in used_regs:
+                        block.ops.append(op)
                 elif isinstance(op, SignalOp):
                     assert not (set(op.signal_args) & unassigned_regs)
+                    if op.dst not in used_regs:
+                        # Can't just delete the op, since this op has side effects.
+                        op.dst = None
                     block.ops.append(op)
 
                 # NONLINEAR OPS
@@ -2464,6 +2486,70 @@ class Compiler:
             self.compute_dominators()
         return any_change
 
+    def cfg_propagate_copies(self) -> bool:
+        # Remapping is from destination to source in various assignments.
+        remapping: dict[Register, Register] = {}
+        for block in self.basic_blocks:
+            for op in block.ops:
+                if not isinstance(op, CopyOp):
+                    continue
+                remapping[op.dst] = remapping.get(op.src, op.src)
+
+        any_change = False
+
+        def remap(reg: Register) -> Register:
+            nonlocal any_change
+            remapped = remapping.get(reg, reg)
+            if remapped != reg:
+                any_change = True
+            return remapped
+
+        for block in self.basic_blocks:
+            for op in block.ops:
+                if isinstance(op, UnreachableOp):
+                    pass
+                elif isinstance(op, CopyOp):
+                    op.src = remap(op.src)
+                elif isinstance(op, BasicBlockPhiOp):
+                    op.srcs = [(remap(reg), block) for reg, block in op.srcs]
+                elif isinstance(op, LiteralOp):
+                    pass
+                elif isinstance(op, InvokeRegisterOp):
+                    op.callable = remap(op.callable)
+                    op.call_args = [remap(arg) for arg in op.call_args]
+                elif isinstance(op, InvokeMultimethodOp):
+                    op.call_args = [remap(arg) for arg in op.call_args]
+                elif isinstance(op, InvokeMethodOp):
+                    op.call_args = [remap(arg) for arg in op.call_args]
+                elif isinstance(op, InvokeQuoteOp):
+                    op.call_args = [remap(arg) for arg in op.call_args]
+                elif isinstance(op, InvokeIntrinsicOp):
+                    op.call_args = [remap(arg) for arg in op.call_args]
+                elif isinstance(op, InvokeNativeOp):
+                    op.call_args = [remap(arg) for arg in op.call_args]
+                elif isinstance(op, ClosureOp):
+                    pass
+                elif isinstance(op, SlotLookupOp):
+                    pass
+                elif isinstance(op, VectorOp):
+                    op.components = [remap(comp) for comp in op.components]
+                elif isinstance(op, TupleOp):
+                    op.components = [remap(comp) for comp in op.components]
+                elif isinstance(op, SignalOp):
+                    op.signal_args = [remap(arg) for arg in op.signal_args]
+                elif isinstance(op, BasicBlockJumpOp):
+                    pass
+                elif isinstance(op, ReturnOp):
+                    op.value = remap(op.value)
+                elif isinstance(op, BasicBlockMultimethodDispatchOp):
+                    op.dispatch_args = [remap(arg) for arg in op.dispatch_args]
+                elif isinstance(op, BasicBlockIfElseOp):
+                    op.condition = remap(op.condition)
+                else:
+                    raise AssertionError(f"forgot an IROp: {type(op)}")
+
+        return any_change
+
     def compile_to_low_level_bytecode(self) -> None:
         raise NotImplementedError()
 
@@ -2675,43 +2761,45 @@ def print_ir_block(block: TreeIRBlock, depth: int = 0):
         print_op(i, op, depth)
 
 
-def regs_referenced_by_basic_ir_op(op: IROp) -> set[Register]:
-    # dst-set
-    ds = set([op.dst] if op.dst else [])
-
+def basic_ir_op_reg_srcs(op: IROp) -> set[Register]:
     if isinstance(op, UnreachableOp):
-        return ds
+        return set()
     elif isinstance(op, ReturnOp):
         return set([op.value])
     elif isinstance(op, CopyOp):
-        return ds | set([op.src])
+        return set([op.src])
     elif isinstance(op, LiteralOp):
-        return ds
+        return set()
     elif isinstance(op, BaseInvokeOp):
-        refs = ds | set(op.call_args)
+        refs = set(op.call_args)
         if isinstance(op, InvokeRegisterOp):
             refs |= set([op.callable])
         return refs
     elif isinstance(op, ClosureOp):
-        return ds
+        return set()
     elif isinstance(op, SlotLookupOp):
-        return ds
+        return set()
     elif isinstance(op, VectorOp):
-        return ds | set(op.components)
+        return set(op.components)
     elif isinstance(op, TupleOp):
-        return ds | set(op.components)
+        return set(op.components)
     elif isinstance(op, SignalOp):
-        return ds | set(op.signal_args)
+        return set(op.signal_args)
     elif isinstance(op, BasicBlockJumpOp):
         return set()
     elif isinstance(op, BasicBlockPhiOp):
-        return ds | set([reg for reg, _ in op.srcs])
+        return set([reg for reg, _ in op.srcs])
     elif isinstance(op, BasicBlockMultimethodDispatchOp):
         return set([arg for arg in op.dispatch_args if arg is not None])
     elif isinstance(op, BasicBlockIfElseOp):
         return set([op.condition])
     else:
         raise AssertionError(f"forgot an IROp: {type(op)}")
+
+
+def basic_ir_op_reg_refs(op: IROp) -> set[Register]:
+    # dst-set
+    return set([op.dst] if op.dst else []) | basic_ir_op_reg_srcs(op)
 
 
 def print_basic_blocks(blocks: list[BasicIRBlock]):
@@ -2735,7 +2823,7 @@ def print_basic_blocks(blocks: list[BasicIRBlock]):
         )
         if block.types:
             print(colored("register types:", "grey"))
-            referenced_regs = set().union(*[regs_referenced_by_basic_ir_op(op) for op in block.ops])
+            referenced_regs = set().union(*[basic_ir_op_reg_refs(op) for op in block.ops])
             for reg in sorted(
                 referenced_regs, key=lambda r: ((0 if isinstance(r, SlotRegister) else 1), r.index)
             ):

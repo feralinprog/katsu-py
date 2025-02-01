@@ -1270,8 +1270,13 @@ def eval_toplevel(expr: Expr, context: Context) -> Value:
     compiler = compilation.Compiler.compile_toplevel_expr(context, expr)
     # TODO: delete this special case. This just blindly assumes the expression was a simple name lookup.
     # just doing this for now in order to test out other compilation
-    assert len(compiler.ir.ops) <= 3
-    return context.slots[compiler.ir.ops[1].slot_name] if len(compiler.ir.ops) > 1 else NullValue()
+    assert len(compiler.basic_blocks) == 1
+    assert len(compiler.basic_blocks[0].ops) == 2
+    op = compiler.basic_blocks[0].ops[0]
+    if hasattr(op, "slot_name"):
+        return context.slots[op.slot_name]
+    else:
+        return op.value
     bytecode = compiler.low_level_bytecode
     compilation.show_compiler_output(
         expr, bytecode, compiler.multimethod_deps, is_recompilation=False
