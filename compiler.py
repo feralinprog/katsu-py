@@ -1966,6 +1966,8 @@ class Compiler:
         return any_change
 
     def compute_dominators(self) -> None:
+        reachable_blocks = self.find_reachable_blocks()
+
         for block in self.basic_blocks:
             if block.is_entry:
                 block.dominators = set([block])
@@ -1978,9 +1980,10 @@ class Compiler:
             for block in self.basic_blocks:
                 if block.is_entry:
                     continue
-                if block.incoming:
+                reachable_preds = block.incoming & reachable_blocks
+                if reachable_preds:
                     new_dominators = set([block]) | set.intersection(
-                        *[pred.dominators for pred in block.incoming]
+                        *[pred.dominators for pred in reachable_preds]
                     )
                 else:
                     new_dominators = set([block])
@@ -1988,11 +1991,8 @@ class Compiler:
                     any_change = True
                     block.dominators = new_dominators
 
-    def cfg_eliminate_unreachable_code(self) -> bool:
+    def find_reachable_blocks(self) -> set[BasicIRBlock]:
         # A block is unreachable if there is no path from the entry block to it.
-        # First we visit blocks from the entry block to determine reachability;
-        # then we collect the list of registers to 'delete' (due to unreachable assignments),
-        # and propagate their deletion through the rest of the blocks.
         reachable_blocks = set()
         queue = [block for block in self.basic_blocks if block.is_entry]
         while queue:
@@ -2001,10 +2001,15 @@ class Compiler:
             for succ in block.outgoing:
                 if succ not in reachable_blocks:
                     queue.append(succ)
+        return reachable_blocks
 
-        unreachable_blocks = set(
-            [block for block in self.basic_blocks if block not in reachable_blocks]
-        )
+    def cfg_eliminate_unreachable_code(self) -> bool:
+        # A block is unreachable if there is no path from the entry block to it.
+        # First we visit blocks from the entry block to determine reachability;
+        # then we collect the list of registers to 'delete' (due to unreachable assignments),
+        # and propagate their deletion through the rest of the blocks.
+        reachable_blocks = self.find_reachable_blocks()
+        unreachable_blocks = set(self.basic_blocks) - reachable_blocks
         # Sanity check: no reachable block should have an outgoing edge to an unreachable block.
         # (Unreachable blocks may have outgoing edges to reachable blocks, though.)
         for block in reachable_blocks:
