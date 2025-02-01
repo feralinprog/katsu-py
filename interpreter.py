@@ -484,6 +484,9 @@ class Method:
     # This also includes a matcher for the receiver.
     param_matchers: list[ParameterMatcher]
     body: MethodBody
+    # Return type, or None if return type is unknown / unspecified (so consumers must assume
+    # the method can produce a value of any type).
+    return_type: Optional[TypeValue]
     inline: bool
 
 

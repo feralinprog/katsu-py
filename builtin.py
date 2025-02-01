@@ -73,6 +73,9 @@ for slot, (param_matchers, handler, compile_inline, inline) in intrinsic_handler
         Method(
             param_matchers=param_matchers,
             body=IntrinsicMethodBody(handler, compile_inline),
+            # Return type is not known.
+            # TODO: could support this in the future if there are intrinsics with known return types.
+            return_type=None,
             inline=inline,
         ),
     )
@@ -96,6 +99,7 @@ def builtin_compile_time(name: str, handler) -> None:
 def builtin_method(
     name: str,
     param_matchers: list[Union[ParameterMatcher, TypeValue, None]],
+    return_type: Optional[TypeValue],
     handler,
     inline: bool = False,
 ) -> None:
@@ -113,7 +117,12 @@ def builtin_method(
     create_or_add_method(
         global_context,
         name,
-        Method(matchers, body=NativeMethodBody(NativeHandler(handler)), inline=inline),
+        Method(
+            matchers,
+            body=NativeMethodBody(NativeHandler(handler)),
+            return_type=return_type,
+            inline=inline,
+        ),
     )
 
 
@@ -254,6 +263,7 @@ def declare_method(
             compiled_body=compiled_body,
             tail_recursive=tail_recursive,
         ),
+        return_type=None,
         inline=inline,
     )
     compiled_body.method = method
@@ -308,21 +318,21 @@ def handle__defer_method_(ctxt: Context, receiver: Value, method: SymbolValue) -
     return NullValue()
 
 
-builtin_method("defer-method:", (None, SymbolType), handle__defer_method_)
+builtin_method("defer-method:", (None, SymbolType), NullType, handle__defer_method_)
 
 
 def handle__type(ctxt: Context, receiver: Value) -> Value:
     return type_of(receiver)
 
 
-builtin_method("type", (None,), handle__type, inline=True)
+builtin_method("type", (None,), TypeType, handle__type, inline=True)
 
 
 def handle__is_instance_(ctxt: Context, receiver: Value, type: TypeValue) -> Value:
     return BoolValue(is_subtype(type_of(receiver), type))
 
 
-builtin_method("is-instance:", (None, TypeType), handle__is_instance_)
+builtin_method("is-instance:", (None, TypeType), BoolType, handle__is_instance_)
 
 
 def handle_is_type(_type: TypeValue):
@@ -332,18 +342,20 @@ def handle_is_type(_type: TypeValue):
     return handler
 
 
-builtin_method("Number?", (None,), handle_is_type(NumberType), inline=True)
-builtin_method("String?", (None,), handle_is_type(StringType), inline=True)
-builtin_method("Bool?", (None,), handle_is_type(BoolType), inline=True)
-builtin_method("Null?", (None,), handle_is_type(NullType), inline=True)
-builtin_method("Symbol?", (None,), handle_is_type(SymbolType), inline=True)
-builtin_method("Tuple?", (None,), handle_is_type(TupleType), inline=True)
-builtin_method("Vector?", (None,), handle_is_type(VectorType), inline=True)
-builtin_method("Quote?", (None,), handle_is_type(QuoteType), inline=True)
-builtin_method("Continuation?", (None,), handle_is_type(ContinuationType), inline=True)
-builtin_method("ReturnContinuation?", (None,), handle_is_type(ReturnContinuationType), inline=True)
-builtin_method("Type?", (None,), handle_is_type(TypeType), inline=True)
-builtin_method("DataclassType?", (None,), handle_is_type(DataclassTypeType), inline=True)
+builtin_method("Number?", (None,), BoolType, handle_is_type(NumberType), inline=True)
+builtin_method("String?", (None,), BoolType, handle_is_type(StringType), inline=True)
+builtin_method("Bool?", (None,), BoolType, handle_is_type(BoolType), inline=True)
+builtin_method("Null?", (None,), BoolType, handle_is_type(NullType), inline=True)
+builtin_method("Symbol?", (None,), BoolType, handle_is_type(SymbolType), inline=True)
+builtin_method("Tuple?", (None,), BoolType, handle_is_type(TupleType), inline=True)
+builtin_method("Vector?", (None,), BoolType, handle_is_type(VectorType), inline=True)
+builtin_method("Quote?", (None,), BoolType, handle_is_type(QuoteType), inline=True)
+builtin_method("Continuation?", (None,), BoolType, handle_is_type(ContinuationType), inline=True)
+builtin_method(
+    "ReturnContinuation?", (None,), BoolType, handle_is_type(ReturnContinuationType), inline=True
+)
+builtin_method("Type?", (None,), BoolType, handle_is_type(TypeType), inline=True)
+builtin_method("DataclassType?", (None,), BoolType, handle_is_type(DataclassTypeType), inline=True)
 
 
 def define_dataclass(
@@ -391,6 +403,7 @@ def define_dataclass(
         Method(
             param_matchers=[ParameterAnyMatcher()],
             body=NativeMethodBody(NativeHandler(handle_is_type(_class))),
+            return_type=BoolType,
             inline=False,
         ),
     )
@@ -403,6 +416,7 @@ def define_dataclass(
             # TODO: allow specifying types for slots
             param_matchers=[ParameterValueMatcher(_class)] + [ParameterAnyMatcher()] * len(slots),
             body=NativeMethodBody(handle_generic_dataclass_constructor(ctor_message)),
+            return_type=_class,
             inline=True,
         ),
     )
@@ -415,6 +429,8 @@ def define_dataclass(
             Method(
                 param_matchers=[ParameterTypeMatcher(_class)],
                 body=NativeMethodBody(handle_generic_dataclass_get(get_msg, slot)),
+                # TODO: allow specifying types for slots
+                return_type=None,
                 inline=True,
             ),
         )
@@ -427,6 +443,8 @@ def define_dataclass(
             Method(
                 param_matchers=[ParameterTypeMatcher(_class), ParameterAnyMatcher()],
                 body=NativeMethodBody(handle_generic_dataclass_set(set_msg, slot)),
+                # TODO: allow specifying types for slots
+                return_type=None,
                 inline=True,
             ),
         )
@@ -487,9 +505,12 @@ def handle_generic_dataclass_set(message: str, slot: str) -> NativeHandler:
 
 # TODO: should probably make these compile-time, since they add slot definitions
 builtin_method(
-    "data:extends:has:", (None, SymbolType, VectorType, VectorType), handle__data_extends_has_
+    "data:extends:has:",
+    (None, SymbolType, VectorType, VectorType),
+    NullType,
+    handle__data_extends_has_,
 )
-builtin_method("data:has:", (None, SymbolType, VectorType), handle__data_has_)
+builtin_method("data:has:", (None, SymbolType, VectorType), NullType, handle__data_has_)
 
 
 def handle__mixin_(ctxt: Context, receiver: Value, name: SymbolValue) -> Value:
@@ -503,7 +524,7 @@ def handle__mixin_(ctxt: Context, receiver: Value, name: SymbolValue) -> Value:
 
 
 # TODO: should probably make this compile-time, since they add slot definitions
-builtin_method("mixin:", (None, SymbolType), handle__mixin_)
+builtin_method("mixin:", (None, SymbolType), NullType, handle__mixin_)
 
 
 def handle__mix_in_to_(ctxt: Context, receiver: Value, mixin: TypeValue, type: TypeValue) -> Value:
@@ -513,7 +534,7 @@ def handle__mix_in_to_(ctxt: Context, receiver: Value, mixin: TypeValue, type: T
     return NullValue()
 
 
-builtin_method("mix-in:to:", (None, TypeType, TypeType), handle__mix_in_to_)
+builtin_method("mix-in:to:", (None, TypeType, TypeType), NullType, handle__mix_in_to_)
 
 
 def handle__let_eq_(
@@ -594,13 +615,17 @@ builtin_compile_time("=:", handle__set)
 
 # Each handler is a function from value -> value, where the input value satisfies the provided receiver matcher.
 def builtin_unary_op(
-    op, methods: list[Tuple[Union[ParameterTypeMatcher, TypeValue, None], Callable[[Value], Value]]]
+    op,
+    methods: list[
+        Tuple[Union[ParameterTypeMatcher, TypeValue, None], TypeValue, Callable[[Value], Value]]
+    ],
 ):
-    for receiver_matcher, handler in methods:
+    for receiver_matcher, return_type, handler in methods:
         builtin_method(
             op,
             param_matchers=[receiver_matcher],
             handler=(lambda ctxt, receiver: handler(receiver)),
+            return_type=return_type,
             inline=True,
         )
 
@@ -612,15 +637,17 @@ def builtin_binary_op(
         Tuple[
             Union[ParameterTypeMatcher, TypeValue, None],
             Union[ParameterTypeMatcher, TypeValue, None],
+            TypeValue,
             Callable[[Value, Value], Value],
         ]
     ],
 ):
-    for left_matcher, right_matcher, handler in methods:
+    for left_matcher, right_matcher, return_type, handler in methods:
         builtin_method(
             op + ":",
             param_matchers=[left_matcher, right_matcher],
             handler=(lambda ctxt, left, right: handler(left, right)),
+            return_type=return_type,
             inline=True,
         )
 
@@ -628,112 +655,113 @@ def builtin_binary_op(
 builtin_binary_op(
     "~",
     [
-        (StringType, StringType, (lambda a, b: StringValue(a.value + b.value))),
+        (StringType, StringType, StringType, (lambda a, b: StringValue(a.value + b.value))),
     ],
 )
 
 builtin_binary_op(
     "and",
     [
-        (BoolType, BoolType, (lambda a, b: BoolValue(a.value and b.value))),
+        (BoolType, BoolType, BoolType, (lambda a, b: BoolValue(a.value and b.value))),
     ],
 )
 builtin_binary_op(
     "or",
     [
-        (BoolType, BoolType, (lambda a, b: BoolValue(a.value or b.value))),
+        (BoolType, BoolType, BoolType, (lambda a, b: BoolValue(a.value or b.value))),
     ],
 )
 
 builtin_binary_op(
     "==",
     [
-        (NumberType, NumberType, (lambda a, b: BoolValue(a.value == b.value))),
-        (StringType, StringType, (lambda a, b: BoolValue(a.value == b.value))),
-        (BoolType, BoolType, (lambda a, b: BoolValue(a.value == b.value))),
-        (NullType, NullType, (lambda a, b: BoolValue(True))),
-        (SymbolType, SymbolType, (lambda a, b: BoolValue(a.value == b.value))),
+        (NumberType, NumberType, BoolType, (lambda a, b: BoolValue(a.value == b.value))),
+        (StringType, StringType, BoolType, (lambda a, b: BoolValue(a.value == b.value))),
+        (BoolType, BoolType, BoolType, (lambda a, b: BoolValue(a.value == b.value))),
+        (NullType, NullType, BoolType, (lambda a, b: BoolValue(True))),
+        (SymbolType, SymbolType, BoolType, (lambda a, b: BoolValue(a.value == b.value))),
         # TODO: deep equality
-        (TupleType, TupleType, (lambda a, b: BoolValue(a == b))),
+        (TupleType, TupleType, BoolType, (lambda a, b: BoolValue(a == b))),
         # TODO: deep equality
-        (VectorType, VectorType, (lambda a, b: BoolValue(a == b))),
-        (None, None, (lambda a, b: BoolValue(a == b))),
+        (VectorType, VectorType, BoolType, (lambda a, b: BoolValue(a == b))),
+        (None, None, BoolType, (lambda a, b: BoolValue(a == b))),
     ],
 )
 # TODO: fix this operator
 builtin_binary_op(
     "!=",
     [
-        (None, None, (lambda a, b: BoolValue(a.value == b.value))),
+        (None, None, BoolType, (lambda a, b: BoolValue(a.value == b.value))),
     ],
 )
 
 builtin_binary_op(
     "<",
     [
-        (NumberType, NumberType, (lambda a, b: BoolValue(a.value < b.value))),
+        (NumberType, NumberType, BoolType, (lambda a, b: BoolValue(a.value < b.value))),
     ],
 )
 builtin_binary_op(
     "<=",
     [
-        (NumberType, NumberType, (lambda a, b: BoolValue(a.value <= b.value))),
+        (NumberType, NumberType, BoolType, (lambda a, b: BoolValue(a.value <= b.value))),
     ],
 )
 builtin_binary_op(
     ">",
     [
-        (NumberType, NumberType, (lambda a, b: BoolValue(a.value > b.value))),
+        (NumberType, NumberType, BoolType, (lambda a, b: BoolValue(a.value > b.value))),
     ],
 )
 builtin_binary_op(
     ">=",
     [
-        (NumberType, NumberType, (lambda a, b: BoolValue(a.value >= b.value))),
+        (NumberType, NumberType, BoolType, (lambda a, b: BoolValue(a.value >= b.value))),
     ],
 )
 
 builtin_binary_op(
     "+",
     [
-        (NumberType, NumberType, (lambda a, b: NumberValue(a.value + b.value))),
+        (NumberType, NumberType, NumberType, (lambda a, b: NumberValue(a.value + b.value))),
     ],
 )
 builtin_binary_op(
     "-",
     [
-        (NumberType, NumberType, (lambda a, b: NumberValue(a.value - b.value))),
+        (NumberType, NumberType, NumberType, (lambda a, b: NumberValue(a.value - b.value))),
     ],
 )
 builtin_binary_op(
     "*",
     [
-        (NumberType, NumberType, (lambda a, b: NumberValue(a.value * b.value))),
+        (NumberType, NumberType, NumberType, (lambda a, b: NumberValue(a.value * b.value))),
     ],
 )
 builtin_binary_op(
     "/",
     [
-        (NumberType, NumberType, (lambda a, b: NumberValue(a.value // b.value))),
+        # Return type is actually unknown, since this could signal on divide-by-zero.
+        (NumberType, NumberType, None, (lambda a, b: NumberValue(a.value // b.value))),
     ],
 )
 
 builtin_unary_op(
     "not",
     [
-        (BoolType, (lambda v: BoolValue(not v.value))),
+        (BoolType, BoolType, (lambda v: BoolValue(not v.value))),
     ],
 )
 builtin_unary_op(
     "+",
     [
-        (NumberType, (lambda v: NumberValue(+v.value))),
+        (NumberType, NumberType, (lambda v: NumberValue(+v.value))),
     ],
 )
 builtin_unary_op(
     "-",
     [
-        (NumberType, (lambda v: NumberValue(-v.value))),
+        (NumberType, NumberType, (lambda v: NumberValue(-v.value))),
     ],
 )
 
@@ -743,7 +771,7 @@ def handle__print(ctxt: Context, receiver: Value) -> Value:
     return NullValue()
 
 
-builtin_method("print", (None,), handle__print)
+builtin_method("print", (None,), NullType, handle__print)
 
 
 def handle__pr(ctxt: Context, receiver: Value) -> Value:
@@ -751,7 +779,7 @@ def handle__pr(ctxt: Context, receiver: Value) -> Value:
     return receiver
 
 
-builtin_method("pr", (None,), handle__pr)
+builtin_method("pr", (None,), NullType, handle__pr)
 
 
 def handle__print_(ctxt: Context, receiver: Value, value: Value) -> Value:
@@ -759,7 +787,7 @@ def handle__print_(ctxt: Context, receiver: Value, value: Value) -> Value:
     return NullValue()
 
 
-builtin_method("print:", (None, None), handle__print_)
+builtin_method("print:", (None, None), NullType, handle__print_)
 
 builtin_value("t", BoolValue(True))
 builtin_value("f", BoolValue(False))
@@ -770,7 +798,7 @@ def handle__to_string(ctxt: Context, receiver: Value) -> Value:
     return StringValue(str(receiver))
 
 
-builtin_method(">string", (None,), handle__to_string)
+builtin_method(">string", (None,), StringType, handle__to_string)
 
 
 def handle__at_(ctxt: Context, receiver: Value, index: Value) -> Value:
@@ -783,7 +811,8 @@ def handle__at_(ctxt: Context, receiver: Value, index: Value) -> Value:
         raise ValueError(f"at: requires a vector; got {receiver}")
 
 
-builtin_method("at:", (VectorType, NumberType), handle__at_)
+# Return type is unknown.
+builtin_method("at:", (VectorType, NumberType), None, handle__at_)
 
 
 def handle__at_eq_(ctxt: Context, receiver: Value, index: Value, value: Value) -> Value:
@@ -797,7 +826,8 @@ def handle__at_eq_(ctxt: Context, receiver: Value, index: Value, value: Value) -
         raise ValueError(f"at: requires a vector; got {receiver}")
 
 
-builtin_method("at:=:", (VectorType, NumberType, None), handle__at_eq_)
+# Return type is unknown.
+builtin_method("at:=:", (VectorType, NumberType, None), None, handle__at_eq_)
 
 
 def handle__append_(ctxt: Context, receiver: Value, value: Value) -> Value:
@@ -808,7 +838,7 @@ def handle__append_(ctxt: Context, receiver: Value, value: Value) -> Value:
         raise ValueError(f"append: requires a vector; got {receiver}")
 
 
-builtin_method("append:", (VectorType, None), handle__append_)
+builtin_method("append:", (VectorType, None), VectorType, handle__append_)
 
 
 def handle__pop_(ctxt: Context, receiver: Value) -> Value:
@@ -818,7 +848,8 @@ def handle__pop_(ctxt: Context, receiver: Value) -> Value:
         raise ValueError(f"pop: requires a vector; got {receiver}")
 
 
-builtin_method("pop", (VectorType,), handle__pop_)
+# Return type is unknown.
+builtin_method("pop", (VectorType,), None, handle__pop_)
 
 
 def handle__length(ctxt: Context, receiver: Value) -> Value:
@@ -830,8 +861,8 @@ def handle__length(ctxt: Context, receiver: Value) -> Value:
         raise ValueError(f"length requires a vector or string; got {receiver}")
 
 
-builtin_method("length", (VectorType,), handle__length)
-builtin_method("length", (StringType,), handle__length)
+builtin_method("length", (VectorType,), NumberType, handle__length)
+builtin_method("length", (StringType,), NumberType, handle__length)
 
 
 def handle__show_current_context(ctxt: Context, receiver: Value) -> Value:
@@ -846,7 +877,7 @@ def handle__show_current_context(ctxt: Context, receiver: Value) -> Value:
     return NullValue()
 
 
-builtin_method("<show-current-context>", (None,), handle__show_current_context)
+builtin_method("<show-current-context>", (None,), NullType, handle__show_current_context)
 
 
 def handle__query_user_for_restart_(
@@ -878,6 +909,10 @@ def handle__query_user_for_restart_(
         return NumberValue(index - 1)
 
 
+# Return type is unknown.
 builtin_method(
-    "query-user-for-restart:condition:", (None, VectorType, None), handle__query_user_for_restart_
+    "query-user-for-restart:condition:",
+    (None, VectorType, None),
+    None,
+    handle__query_user_for_restart_,
 )

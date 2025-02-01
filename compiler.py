@@ -273,6 +273,7 @@ class InvokeIntrinsicOp(BaseInvokeOp):
 @dataclass(kw_only=True)
 class InvokeNativeOp(BaseInvokeOp):
     native: NativeHandler
+    return_type: Optional[TypeValue]
 
 
 @dataclass(kw_only=True)
@@ -1359,6 +1360,7 @@ class Compiler:
                         InvokeNativeOp(
                             dst=op.dst,
                             native=method.body.handler,
+                            return_type=method.return_type,
                             call_args=op.call_args,
                             tail_call=op.tail_call,
                             tail_position=op.tail_position,
@@ -2252,8 +2254,11 @@ class Compiler:
                 elif isinstance(op, LiteralOp):
                     reg_types[op.dst] = [type_of(op.value)]
                 elif isinstance(op, BaseInvokeOp):
-                    # TODO: use return type information, _especially_ for natives / intrinsics
-                    reg_types[op.dst] = ANY_TYPE
+                    # TODO: use any more return type information?
+                    if isinstance(op, InvokeNativeOp) and op.return_type:
+                        reg_types[op.dst] = [op.return_type]
+                    else:
+                        reg_types[op.dst] = ANY_TYPE
                 elif isinstance(op, ClosureOp):
                     reg_types[op.dst] = [QuoteType]
                 elif isinstance(op, SlotLookupOp):
@@ -2261,10 +2266,10 @@ class Compiler:
                     reg_types[op.dst] = ANY_TYPE
                 elif isinstance(op, VectorOp):
                     # TODO: might want to get fancier in the future with per-element typing.
-                    reg_types[op.dst] = VectorType
+                    reg_types[op.dst] = [VectorType]
                 elif isinstance(op, TupleOp):
                     # TODO: might want to get fancier in the future with per-element typing.
-                    reg_types[op.dst] = TupleType
+                    reg_types[op.dst] = [TupleType]
                 elif isinstance(op, SignalOp):
                     # Signaling really can produce any result -- it's up to the user / debugger.
                     reg_types[op.dst] = ANY_TYPE
@@ -2636,6 +2641,8 @@ def print_op(index: int, op: IROp, depth: int):
             print(f"invoke-intrinsic {op.intrinsic.handler}", end="")
         elif isinstance(op, InvokeNativeOp):
             print(f"invoke-native {op.native.handler}", end="")
+            if op.return_type:
+                print(f" (returns {op.return_type})", end="")
         else:
             raise AssertionError(f"forgot an op type: {op}")
 
