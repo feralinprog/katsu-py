@@ -697,7 +697,7 @@ class Compiler:
 
         return compiler
 
-    def compile_body(self, expr: Expr) -> "Compiler":
+    def compile_body(self, expr: Expr) -> None:
         try:
             print(colored("~~~~~~~~~ COMPILATION PROCESS ~~~~~~~~~~~~", "cyan"))
 
