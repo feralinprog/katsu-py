@@ -720,7 +720,10 @@ class Compiler:
                 self.ir, expr, tail_position=True, currently_inlining=False
             )
             if not result_reg:
-                result_reg = self.add_ir_op(self.ir, LiteralOp(dst=self.allocate_virtual_reg(), value=NullValue(), span=expr.span))
+                result_reg = self.add_ir_op(
+                    self.ir,
+                    LiteralOp(dst=self.allocate_virtual_reg(), value=NullValue(), span=expr.span),
+                )
             self.add_ir_op(self.ir, ReturnOp(value=result_reg, span=expr.span))
             print_ir_block(self.ir, depth=1)
 
@@ -2078,7 +2081,9 @@ class Compiler:
                     assert not (set(reg for reg, _ in op.srcs) <= unassigned_regs)
                     if op.dst in used_regs:
                         op.srcs = [
-                            (reg, src_block) for reg, src_block in op.srcs if reg not in unassigned_regs
+                            (reg, src_block)
+                            for reg, src_block in op.srcs
+                            if reg not in unassigned_regs
                         ]
                         if len(op.srcs) == 1:
                             # Convert to a direct assignment.
