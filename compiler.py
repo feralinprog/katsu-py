@@ -1947,9 +1947,14 @@ class Compiler:
             for op in block.ops:
                 if not isinstance(op, BasicBlockPhiOp):
                     continue
-                op.srcs = [
-                    (reg, combining_map.get(src_block, src_block)) for reg, src_block in op.srcs
-                ]
+
+                def walk(b):
+                    # May take several steps, if we deleted multiple blocks in a linear chain.
+                    while b in combining_map:
+                        b = combining_map[b]
+                    return b
+
+                op.srcs = [(reg, walk(src_block)) for reg, src_block in op.srcs]
 
         print(
             colored(
