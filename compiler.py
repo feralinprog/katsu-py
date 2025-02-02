@@ -541,6 +541,11 @@ class PopLROp(LROp):
 
 
 @dataclass
+class DropLROp(LROp):
+    pass
+
+
+@dataclass
 class InvokeRegisterLROp(LROp):
     callable: Register
     num_args: int
@@ -2764,58 +2769,54 @@ class Compiler:
                     pass
                 elif isinstance(op, LiteralOp):
                     add_lr_op(LiteralLROp(dst=op.dst, value=op.value, span=op.span))
-                elif isinstance(op, InvokeRegisterOp):
+                elif isinstance(
+                    op, (InvokeRegisterOp, InvokeMultimethodOp, InvokeIntrinsicOp, InvokeNativeOp)
+                ):
                     for arg in op.call_args:
                         add_lr_op(PushLROp(src=arg, span=op.span))
-                    add_lr_op(
-                        InvokeRegisterLROp(
-                            callable=op.callable,
-                            num_args=len(op.call_args),
-                            tail_call=op.tail_call,
-                            span=op.span,
+                    if isinstance(op, InvokeRegisterOp):
+                        add_lr_op(
+                            InvokeRegisterLROp(
+                                callable=op.callable,
+                                num_args=len(op.call_args),
+                                tail_call=op.tail_call,
+                                span=op.span,
+                            )
                         )
-                    )
-                    if op.dst:
-                        add_lr_op(PopLROp(dst=op.dst, span=op.span))
-                elif isinstance(op, InvokeMultimethodOp):
-                    for arg in op.call_args:
-                        add_lr_op(PushLROp(src=arg, span=op.span))
-                    add_lr_op(
-                        InvokeMultimethodLROp(
-                            multimethod=op.multimethod,
-                            num_args=len(op.call_args),
-                            tail_call=op.tail_call,
-                            span=op.span,
+                    elif isinstance(op, InvokeMultimethodOp):
+                        add_lr_op(
+                            InvokeMultimethodLROp(
+                                multimethod=op.multimethod,
+                                num_args=len(op.call_args),
+                                tail_call=op.tail_call,
+                                span=op.span,
+                            )
                         )
-                    )
-                    if op.dst:
-                        add_lr_op(PopLROp(dst=op.dst, span=op.span))
-                elif isinstance(op, InvokeIntrinsicOp):
-                    for arg in op.call_args:
-                        add_lr_op(PushLROp(src=arg, span=op.span))
-                    add_lr_op(
-                        InvokeIntrinsicLROp(
-                            intrinsic=op.intrinsic,
-                            num_args=len(op.call_args),
-                            tail_call=op.tail_call,
-                            span=op.span,
+                    elif isinstance(op, InvokeIntrinsicOp):
+                        add_lr_op(
+                            InvokeIntrinsicLROp(
+                                intrinsic=op.intrinsic,
+                                num_args=len(op.call_args),
+                                tail_call=op.tail_call,
+                                span=op.span,
+                            )
                         )
-                    )
-                    if op.dst:
-                        add_lr_op(PopLROp(dst=op.dst, span=op.span))
-                elif isinstance(op, InvokeNativeOp):
-                    for arg in op.call_args:
-                        add_lr_op(PushLROp(src=arg, span=op.span))
-                    add_lr_op(
-                        InvokeNativeLROp(
-                            native=op.native,
-                            num_args=len(op.call_args),
-                            tail_call=op.tail_call,
-                            span=op.span,
+                    elif isinstance(op, InvokeNativeOp):
+                        add_lr_op(
+                            InvokeNativeLROp(
+                                native=op.native,
+                                num_args=len(op.call_args),
+                                tail_call=op.tail_call,
+                                span=op.span,
+                            )
                         )
-                    )
-                    if op.dst:
-                        add_lr_op(PopLROp(dst=op.dst, span=op.span))
+                    else:
+                        raise AssertionError("shouldn't get here")
+                    if not op.tail_call:
+                        if op.dst:
+                            add_lr_op(PopLROp(dst=op.dst, span=op.span))
+                        else:
+                            add_lr_op(DropLROp(span=op.span))
                 elif isinstance(op, ClosureOp):
                     add_lr_op(ClosureLROp(dst=op.dst, quote=op.quote, span=op.span))
                 elif isinstance(op, SlotLookupOp):
@@ -3212,6 +3213,8 @@ def print_low_level_bytecode(ops: list[LROp]):
             print(f"push {op.src}")
         elif isinstance(op, PopLROp):
             print(f"{op.dst} = pop")
+        elif isinstance(op, DropLROp):
+            print(f"drop")
         elif isinstance(op, InvokeRegisterLROp):
             if op.tail_call:
                 print("tail-", end="")
@@ -3269,6 +3272,8 @@ def print_low_level_bytecode(ops: list[LROp]):
                 print(f"  no-matching-method -> jump {op.no_matching_method}")
             if op.ambiguous_method_resolution:
                 print(f"  ambiguous-method-resolution -> jump {op.ambiguous_method_resolution}")
+        else:
+            raise AssertionError(f"unknown lr-op {op}")
 
 
 def show_compiler_output(
