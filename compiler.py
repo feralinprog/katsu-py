@@ -2155,7 +2155,8 @@ class Compiler:
         # This function:
         # * Deletes unreachable blocks (and makes sure to delete from the rest of the reachable
         #   blocks any use of registers which were generated from unreachable blocks).
-        # * Deletes any ops whose output is not a source register of any reachable block.
+        # * Deletes unreachable _ops_ in reachable blocks (ops which come after tail calls).
+        # * Deletes any ops whose output is not a source register of any reachable op.
         #   (Caveat: for ops with side effects, just delete the destination register instead of
         #   the whole op.)
 
@@ -2173,16 +2174,49 @@ class Compiler:
         for block in unreachable_blocks:
             self.basic_blocks.remove(block)
 
+        # List of registers used by reachable code.
         used_regs = set()
-        for block in reachable_blocks:
-            for op in block.ops:
-                used_regs |= basic_ir_op_reg_srcs(op)
-
+        # List of registers which are outputs of unreachable code.
         unassigned_regs = set()
+
+        # We already know that if there are unreachable blocks, we're going to delete those.
+        any_change = len(unreachable_blocks) > 0
+
+        for block in reachable_blocks:
+            beyond_tail_call = False
+            for op in block.ops:
+                if beyond_tail_call:
+                    # These ops will be deleted.
+                    any_change = True
+                    if op.dst:
+                        unassigned_regs.add(op.dst)
+                else:
+                    used_regs |= basic_ir_op_reg_srcs(op)
+                    if isinstance(op, BaseInvokeOp) and op.tail_call:
+                        beyond_tail_call = True
+                        if op.dst:
+                            unassigned_regs.add(op.dst)
+
         for block in unreachable_blocks:
             for op in block.ops:
                 if op.dst:
                     unassigned_regs.add(op.dst)
+
+        # Now delete unreachable ops from reachable blocks.
+        for block in reachable_blocks:
+            for i in range(len(block.ops)):
+                op = block.ops[i]
+                if isinstance(op, BaseInvokeOp) and op.tail_call:
+                    block.ops = block.ops[: i + 1]
+                    # Unlink this block from successors.
+                    for succ in block.outgoing:
+                        succ.incoming.remove(block)
+                    block.outgoing.clear()
+                    break
+
+        # That could have made other blocks unreachable.
+        reachable_blocks = self.find_reachable_blocks()
+        unreachable_blocks = set(self.basic_blocks) - reachable_blocks
 
         print(
             colored(
@@ -2267,8 +2301,8 @@ class Compiler:
                 else:
                     raise AssertionError(f"Forgot an op: {type(op)}")
 
-        # No need to recompute dominators; unreachable blocks cannot be dominators of reachable blocks.
-        return len(unreachable_blocks) != 0
+        self.compute_dominators()
+        return any_change
 
     # Inputs:
     #   join:
