@@ -603,7 +603,7 @@ class SignalLROp(LROp):
 
 @dataclass
 class JumpLROp(LROp):
-    target: int
+    target: Union[int, "LRBlock"]
 
 
 @dataclass
@@ -616,7 +616,7 @@ class ConditionalJumpLROp(LROp):
     condition: Register
     match: bool
     # Jump to the target if the condition value equals the match value.
-    target: int
+    target: Union[int, "LRBlock"]
 
 
 @dataclass
@@ -626,9 +626,22 @@ class MultimethodDispatchLROp(LROp):
     dispatch_args: list[Register]
     # List of dispatch options, with parameter matchers (length equals that of dispatch_args)
     # and jump target if this is the best selected option.
-    dispatch: list[Tuple[list[ParameterMatcher], int]]
-    no_matching_method: Optional[int]
-    ambiguous_method_resolution: Optional[int]
+    dispatch: list[Tuple[list[ParameterMatcher], Union[int, "LRBlock"]]]
+    no_matching_method: Optional[Union[int, "LRBlock"]]
+    ambiguous_method_resolution: Optional[Union[int, "LRBlock"]]
+
+
+# Block of low-level representation ops. Last stop before linearizing blocks into a single
+# op array.
+@dataclass
+class LRBlock:
+    id: int
+    ops: list[LROp]
+    incoming: set["LRBlock"]
+    outgoing: set["LRBlock"]
+
+    def __hash__(self) -> int:
+        return hash(self.id)
 
 
 def should_inline_multimethod_dispatch(multimethod: MultiMethod) -> bool:
@@ -670,6 +683,9 @@ class Compiler:
     # Parameter types, or None if any type is allowed / there wasn't a parameter matcher.
     parameter_types: dict[SlotRegister, Optional[TypeValue]]
 
+    lr_blocks: list[LRBlock]
+    entry_lr_block: Optional[LRBlock]
+
     low_level_bytecode: list[LROp]
 
     # Internal use only.
@@ -682,6 +698,8 @@ class Compiler:
         self.entry_basic_block = None
         self.num_basic_blocks = 0
         self.parameter_types = {}
+        self.lr_blocks = []
+        self.entry_lr_block = None
         self.low_level_bytecode = []
 
     # Add an IR operation, and return the destination register (for convenience).
@@ -938,9 +956,12 @@ class Compiler:
                 for block in self.basic_blocks:
                     block.types = None
 
-            print(colored("compiling to low level bytecode:", "red"))
-            self.compile_to_low_level_bytecode()
-            print_low_level_bytecode(self.low_level_bytecode)
+            print(colored("compiling to low level blocks:", "red"))
+            self.compile_to_low_level_blocks()
+            print_low_level_blocks(self.lr_blocks)
+            # print(colored("linearizing to low level bytecode:", "red"))
+            # self.compile_to_low_level_bytecode()
+            # print_low_level_bytecode(self.low_level_bytecode)
 
             print(colored("~~~~~~~~~ COMPILATION PROCESS END ~~~~~~~~~~~~", "grey"))
         except Exception as e:
@@ -2724,18 +2745,13 @@ class Compiler:
 
         return any_change
 
-    def compile_to_low_level_bytecode(self) -> None:
-        # Maps each basic block to where it begins in the low-level ops.
-        basic_block_to_position = {}
+    def compile_to_low_level_blocks(self) -> None:
+        # Maps each basic block to its corresponding generated LR block.
+        basic_block_to_lr_block = {}
         # Maps fake positions (negative numbers, which are converted to indices in this list
         # as -fake_target - 1) to basic blocks, so we can fix up jump targets in a second pass
-        # once all basic block positions are known.
+        # once we have generated LR blocks.
         lr_op_fixups = []
-
-        def add_lr_op(op: LROp):
-            assert isinstance(op, LROp)
-            self.low_level_bytecode.append(op)
-            return op
 
         def gen_jump(block: BasicIRBlock) -> int:
             lr_op_fixups.append(block)
@@ -2750,13 +2766,19 @@ class Compiler:
                     if src_block == block:
                         add_lr_op(CopyLROp(dst=op.dst, src=reg, span=span))
 
-        assert not self.low_level_bytecode
+        assert not self.lr_blocks
+        assert not self.entry_lr_block
 
-        # Assume (and check) that the first block is the entry block.
-        assert self.basic_blocks[0] is self.entry_basic_block
-        # TODO: maybe just do this in depth first search ordering
         for block in self.basic_blocks:
-            basic_block_to_position[block] = len(self.low_level_bytecode)
+            lr_block = LRBlock(id=len(self.lr_blocks), ops=[], incoming=set(), outgoing=set())
+            self.lr_blocks.append(lr_block)
+            basic_block_to_lr_block[block] = lr_block
+
+            def add_lr_op(op: LROp):
+                assert isinstance(op, LROp)
+                lr_block.ops.append(op)
+                return op
+
             for op in block.ops:
                 if isinstance(op, UnreachableOp):
                     raise AssertionError("shouldn't get unreachable op here")
@@ -2862,19 +2884,19 @@ class Compiler:
                         dispatch_op.dispatch.append(
                             (
                                 [method.param_matchers[i] for i in keep_indices],
-                                len(self.low_level_bytecode),
+                                len(lr_block.ops),
                             )
                         )
                         copy_to_phis(block, method_block, span=op.span)
                         add_lr_op(JumpLROp(target=gen_jump(method_block), span=op.span))
 
                     if op.no_matching_method:
-                        dispatch_op.no_matching_method = len(self.low_level_bytecode)
+                        dispatch_op.no_matching_method = len(lr_block.ops)
                         copy_to_phis(block, op.no_matching_method, span=op.span)
                         add_lr_op(JumpLROp(target=gen_jump(op.no_matching_method), span=op.span))
 
                     if op.ambiguous_method_resolution:
-                        dispatch_op.ambiguous_method_resolution = len(self.low_level_bytecode)
+                        dispatch_op.ambiguous_method_resolution = len(lr_block.ops)
                         copy_to_phis(block, op.ambiguous_method_resolution, span=op.span)
                         add_lr_op(
                             JumpLROp(target=gen_jump(op.ambiguous_method_resolution), span=op.span)
@@ -2893,18 +2915,26 @@ class Compiler:
                     )
                     copy_to_phis(block, op.true_block, span=op.span)
                     add_lr_op(JumpLROp(target=gen_jump(op.true_block), span=op.span))
-                    conditional_jump.target = len(self.low_level_bytecode)
+                    conditional_jump.target = len(lr_block.ops)
                     copy_to_phis(block, op.false_block, span=op.span)
                     add_lr_op(JumpLROp(target=gen_jump(op.false_block), span=op.span))
                 else:
                     raise AssertionError(f"forgot an IROp: {type(op)}")
 
         # Fix up jump targets.
-        for op in self.low_level_bytecode:
-            if not isinstance(op, JumpLROp):
-                continue
-            if op.target < 0:
-                op.target = basic_block_to_position[lr_op_fixups[-op.target - 1]]
+        for block in self.lr_blocks:
+            for op in block.ops:
+                if not isinstance(op, JumpLROp):
+                    continue
+                if op.target < 0:
+                    op.target = basic_block_to_lr_block[lr_op_fixups[-op.target - 1]]
+
+        # Add other graph information to the LR blocks.
+        self.entry_lr_block = basic_block_to_lr_block[self.entry_basic_block]
+        for block in self.basic_blocks:
+            lr_block = basic_block_to_lr_block[block]
+            lr_block.incoming = set(basic_block_to_lr_block[pred] for pred in block.incoming)
+            lr_block.outgoing = set(basic_block_to_lr_block[succ] for succ in block.outgoing)
 
 
 should_show_compiler_output = False
@@ -3199,81 +3229,116 @@ def print_basic_blocks(blocks: list[BasicIRBlock]):
         )
 
 
+def print_lr_op(op: LROp):
+    def target_to_str(target: Union[int, LRBlock]) -> str:
+        if isinstance(target, LRBlock):
+            return str(target.id)
+        else:
+            return f"({target})"
+
+    if isinstance(op, CopyLROp):
+        print(f"{op.dst} = {op.src}")
+    elif isinstance(op, LiteralLROp):
+        print(
+            f"{op.dst} = literal {repr(op.value.value) if isinstance(op.value, StringValue) else op.value}"
+        )
+    elif isinstance(op, PushLROp):
+        print(f"push {op.src}")
+    elif isinstance(op, PopLROp):
+        print(f"{op.dst} = pop")
+    elif isinstance(op, DropLROp):
+        print(f"drop")
+    elif isinstance(op, InvokeRegisterLROp):
+        if op.tail_call:
+            print("tail-", end="")
+        print(f"invoke-reg {op.callable} {op.num_args}")
+    elif isinstance(op, InvokeMultimethodLROp):
+        if op.tail_call:
+            print("tail-", end="")
+        print(f"invoke-multi {op.multimethod.name} {op.num_args}")
+    elif isinstance(op, InvokeIntrinsicLROp):
+        if op.tail_call:
+            print("tail-", end="")
+        print(f"invoke-intrinsic {op.intrinsic.handler} {op.num_args}")
+    elif isinstance(op, InvokeNativeLROp):
+        if op.tail_call:
+            print("tail-", end="")
+        print(f"invoke-native {op.native.handler} {op.num_args}")
+    elif isinstance(op, ClosureLROp):
+        print(f"{op.dst} = closure {op.quote}")
+    elif isinstance(op, SlotLookupLROp):
+        print(f"{op.dst} = lookup-slot {op.slot_name}")
+    elif isinstance(op, VectorLROp):
+        print(f"{op.dst} = vector {', '.join(str(comp) for comp in op.components)}")
+    elif isinstance(op, TupleLROp):
+        print(f"{op.dst} = tuple {', '.join(str(comp) for comp in op.components)}")
+    elif isinstance(op, SignalLROp):
+        print(f"{op.dst} = signal {op.condition_name}", end="")
+        if op.signal_args:
+            print(" with " + ", ".join(str(arg) for arg in op.signal_args))
+        else:
+            print()
+    elif isinstance(op, JumpLROp):
+        print(f"jump {target_to_str(op.target)}")
+    elif isinstance(op, ReturnLROp):
+        print(f"return {op.src}")
+    elif isinstance(op, ConditionalJumpLROp):
+        print(f"jump-{'true' if op.match else 'false'} {op.condition} {target_to_str(op.target)}")
+    elif isinstance(op, MultimethodDispatchLROp):
+
+        def matcher_str(matcher):
+            if isinstance(matcher, ParameterAnyMatcher):
+                return "<any>"
+            elif isinstance(matcher, ParameterTypeMatcher):
+                return matcher.param_type.name
+            elif isinstance(matcher, ParameterValueMatcher):
+                return f"eq({matcher.param_value})"
+
+        print(
+            f"multimethod-dispatch {op.slot_name} on {', '.join(str(arg) for arg in op.dispatch_args)}"
+        )
+        for matchers, target in op.dispatch:
+            print(
+                f"  ({', '.join(matcher_str(matcher) for matcher in matchers)}) -> jump {target_to_str(target)}"
+            )
+        if op.no_matching_method:
+            print(f"  no-matching-method -> jump {target_to_str(op.no_matching_method)}")
+        if op.ambiguous_method_resolution:
+            print(
+                f"  ambiguous-method-resolution -> jump {target_to_str(op.ambiguous_method_resolution)}"
+            )
+    else:
+        raise AssertionError(f"unknown lr-op {op}")
+
+
+def print_low_level_blocks(blocks: list[LRBlock]):
+    print(colored("low level blocks:", "grey"))
+    for block in sorted(blocks, key=lambda b: b.id):
+        print(colored(f"===== block {block.id} =====", "green"))
+        print(
+            colored(
+                "incoming: "
+                + ", ".join(str(pred.id) for pred in sorted(block.incoming, key=lambda b: b.id)),
+                "grey",
+            )
+        )
+        for i, op in enumerate(block.ops):
+            print(colored(f"({i}) ", "grey"), end="")
+            print_lr_op(op)
+        print(
+            colored(
+                "outgoing: "
+                + ", ".join(str(succ.id) for succ in sorted(block.outgoing, key=lambda b: b.id)),
+                "grey",
+            )
+        )
+
+
 def print_low_level_bytecode(ops: list[LROp]):
     print(colored("low level bytecode:", "grey"))
     for i, op in enumerate(ops):
         print(colored(f"({i}) ", "grey"), end="")
-        if isinstance(op, CopyLROp):
-            print(f"{op.dst} = {op.src}")
-        elif isinstance(op, LiteralLROp):
-            print(
-                f"{op.dst} = literal {repr(op.value.value) if isinstance(op.value, StringValue) else op.value}"
-            )
-        elif isinstance(op, PushLROp):
-            print(f"push {op.src}")
-        elif isinstance(op, PopLROp):
-            print(f"{op.dst} = pop")
-        elif isinstance(op, DropLROp):
-            print(f"drop")
-        elif isinstance(op, InvokeRegisterLROp):
-            if op.tail_call:
-                print("tail-", end="")
-            print(f"invoke-reg {op.callable} {op.num_args}")
-        elif isinstance(op, InvokeMultimethodLROp):
-            if op.tail_call:
-                print("tail-", end="")
-            print(f"invoke-multi {op.multimethod.name} {op.num_args}")
-        elif isinstance(op, InvokeIntrinsicLROp):
-            if op.tail_call:
-                print("tail-", end="")
-            print(f"invoke-intrinsic {op.intrinsic.handler} {op.num_args}")
-        elif isinstance(op, InvokeNativeLROp):
-            if op.tail_call:
-                print("tail-", end="")
-            print(f"invoke-native {op.native.handler} {op.num_args}")
-        elif isinstance(op, ClosureLROp):
-            print(f"{op.dst} = closure {op.quote}")
-        elif isinstance(op, SlotLookupLROp):
-            print(f"{op.dst} = lookup-slot {op.slot_name}")
-        elif isinstance(op, VectorLROp):
-            print(f"{op.dst} = vector {', '.join(str(comp) for comp in op.components)}")
-        elif isinstance(op, TupleLROp):
-            print(f"{op.dst} = tuple {', '.join(str(comp) for comp in op.components)}")
-        elif isinstance(op, SignalLROp):
-            print(f"{op.dst} = signal {op.condition_name}", end="")
-            if op.signal_args:
-                print(" with " + ", ".join(str(arg) for arg in op.signal_args))
-            else:
-                print()
-        elif isinstance(op, JumpLROp):
-            print(f"jump {op.target}")
-        elif isinstance(op, ReturnLROp):
-            print(f"return {op.src}")
-        elif isinstance(op, ConditionalJumpLROp):
-            print(f"jump-{'true' if op.match else 'false'} {op.condition} {op.target}")
-        elif isinstance(op, MultimethodDispatchLROp):
-
-            def matcher_str(matcher):
-                if isinstance(matcher, ParameterAnyMatcher):
-                    return "<any>"
-                elif isinstance(matcher, ParameterTypeMatcher):
-                    return matcher.param_type.name
-                elif isinstance(matcher, ParameterValueMatcher):
-                    return f"eq({matcher.param_value})"
-
-            print(
-                f"multimethod-dispatch {op.slot_name} on {', '.join(str(arg) for arg in op.dispatch_args)}"
-            )
-            for matchers, target in op.dispatch:
-                print(
-                    f"  ({', '.join(matcher_str(matcher) for matcher in matchers)}) -> jump {target}"
-                )
-            if op.no_matching_method:
-                print(f"  no-matching-method -> jump {op.no_matching_method}")
-            if op.ambiguous_method_resolution:
-                print(f"  ambiguous-method-resolution -> jump {op.ambiguous_method_resolution}")
-        else:
-            raise AssertionError(f"unknown lr-op {op}")
+        print_lr_op(op)
 
 
 def show_compiler_output(
