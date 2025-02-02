@@ -397,7 +397,6 @@ Types: TypeAlias = Union[list[TypeValue], AnyType]
 class BasicIRBlock:
     # For debug only.
     id: int
-    is_entry: bool
     # Only the last operation may have any nonlinear control flow, i.e. any of:
     # - JumpOp (rather, BasicBlockJumpOp)
     # - ReturnOp
@@ -470,8 +469,6 @@ class BasicIRBlock:
         for op in self.ops[:-1]:
             assert isinstance(op, self.linear_op_types)
         assert isinstance(self.ops[-1], self.linear_op_types + self.nonlinear_op_types)
-        if self.is_entry:
-            assert not self.incoming
         for pred in self.incoming:
             assert self in pred.outgoing
         for succ in self.outgoing:
@@ -666,6 +663,7 @@ class Compiler:
     num_labels: int
 
     basic_blocks: list[BasicIRBlock]
+    entry_basic_block: Optional[BasicIRBlock]
     # Keep track of label count for allocation purposes.
     num_basic_blocks: int
 
@@ -681,6 +679,7 @@ class Compiler:
         self.num_virtual_regs = 0
         self.num_labels = 0
         self.basic_blocks = []
+        self.entry_basic_block = None
         self.num_basic_blocks = 0
         self.parameter_types = {}
         self.low_level_bytecode = []
@@ -703,10 +702,9 @@ class Compiler:
         return label
 
     # Allocate the next available basic block id.
-    def allocate_basic_block(self, is_entry=False) -> BasicIRBlock:
+    def allocate_basic_block(self) -> BasicIRBlock:
         block = BasicIRBlock(
             id=self.num_basic_blocks,
-            is_entry=is_entry,
             ops=[],
             incoming=set(),
             outgoing=set(),
@@ -1979,11 +1977,12 @@ class Compiler:
                     raise AssertionError(f"forgot an IROp: {type(op)}")
             return current_block
 
-        entry_block = self.allocate_basic_block(is_entry=True)
+        assert not self.entry_basic_block
+        self.entry_basic_block = self.allocate_basic_block()
         tree_ir_op_to_basic_block = []
         output_block = process_tree_block(
             self.ir,
-            entry_block,
+            self.entry_basic_block,
             label_to_basic_block={},
             tree_ir_op_to_basic_block=tree_ir_op_to_basic_block,
         )
@@ -2038,7 +2037,7 @@ class Compiler:
                 def map_src(src):
                     reg, src = src
                     if src is None and isinstance(reg, SlotRegister):
-                        return (reg, source_block_to_predecessor(entry_block, block))
+                        return (reg, source_block_to_predecessor(self.entry_basic_block, block))
                     if src is None:
                         src = self.find_writer(self.ir, reg)
                     if isinstance(src, IROp):
@@ -2119,7 +2118,7 @@ class Compiler:
         reachable_blocks = self.find_reachable_blocks()
 
         for block in self.basic_blocks:
-            if block.is_entry:
+            if block is self.entry_basic_block:
                 block.dominators = set([block])
             else:
                 block.dominators = set(self.basic_blocks)
@@ -2128,7 +2127,7 @@ class Compiler:
         while any_change:
             any_change = False
             for block in self.basic_blocks:
-                if block.is_entry:
+                if block is self.entry_basic_block:
                     continue
                 if block in reachable_blocks:
                     reachable_preds = block.incoming & reachable_blocks
@@ -2147,7 +2146,7 @@ class Compiler:
     def find_reachable_blocks(self) -> set[BasicIRBlock]:
         # A block is unreachable if there is no path from the entry block to it.
         reachable_blocks = set()
-        queue = [block for block in self.basic_blocks if block.is_entry]
+        queue = [self.entry_basic_block]
         while queue:
             block, queue = queue[0], queue[1:]
             reachable_blocks.add(block)
@@ -2340,7 +2339,7 @@ class Compiler:
         work_queue: list[BasicIRBlock]
 
         def do_work(block: BasicIRBlock, force_transfer: bool):
-            if block.is_entry:
+            if block is self.entry_basic_block:
                 # Don't join the in-state; just use the provided initial values, always.
                 in_state = last_in_state[block]
             else:
@@ -2362,7 +2361,7 @@ class Compiler:
         # Prime the pump:
         work_queue = []
         initial_visited = set()
-        initial_visit_queue = [block for block in self.basic_blocks if block.is_entry]
+        initial_visit_queue = [self.entry_basic_block]
         while initial_visit_queue:
             block, initial_visit_queue = initial_visit_queue[0], initial_visit_queue[1:]
             initial_visited.add(block)
@@ -2522,7 +2521,7 @@ class Compiler:
         }
 
         for block in self.basic_blocks:
-            if not block.is_entry:
+            if block is not self.entry_basic_block:
                 continue
             reg_types = initial_in_state[block]
             for reg, param_type in self.parameter_types.items():
@@ -2754,7 +2753,7 @@ class Compiler:
         assert not self.low_level_bytecode
 
         # Assume (and check) that the first block is the entry block.
-        assert self.basic_blocks[0].is_entry
+        assert self.basic_blocks[0] is self.entry_basic_block
         # TODO: maybe just do this in depth first search ordering
         for block in self.basic_blocks:
             basic_block_to_position[block] = len(self.low_level_bytecode)
@@ -3160,9 +3159,7 @@ def basic_ir_op_reg_refs(op: IROp) -> set[Register]:
 
 def print_basic_blocks(blocks: list[BasicIRBlock]):
     for block in sorted(blocks, key=lambda b: b.id):
-        print(
-            colored(f"===== block {block.id} {'(entry) ' if block.is_entry else ''}=====", "green")
-        )
+        print(colored(f"===== block {block.id} =====", "green"))
         print(
             colored(
                 "incoming: "
