@@ -2835,6 +2835,9 @@ class Compiler:
                         )
                     )
                 elif isinstance(op, BasicBlockJumpOp):
+                    # TODO: ideally in this case we don't need to add copy ops, since we could have
+                    # just remapped the originating ops' destinations according to what we would
+                    # otherwise copy here.
                     copy_to_phis(block, op.target, span=op.span)
                     add_lr_op(JumpLROp(target=gen_jump(op.target), span=op.span))
                 elif isinstance(op, ReturnOp):
