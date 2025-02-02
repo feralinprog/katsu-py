@@ -1434,23 +1434,20 @@ def compile_intrinsic__if_then_else_(
 ) -> Optional["compilation.Register"]:
     receiver_reg, cond_reg, tbody_reg, fbody_reg = args
 
-    # Note that even if compiling tail calls into the true/false bodies, we must
-    # still add destination registers, in case any of these tail calls are multimethod
-    # invocations.
-
     true_block_ops = []
     true_block_null = compiler.allocate_virtual_reg()
     true_block_ops.append(compilation.LiteralOp(dst=true_block_null, value=NullValue(), span=span))
     true_block_result = compiler.allocate_virtual_reg()
-    true_block_result_op = compilation.InvokeRegisterOp(
-        dst=true_block_result,
-        callable=tbody_reg,
-        call_args=[true_block_null],
-        tail_call=tail_call,
-        tail_position=tail_position,
-        span=span,
+    true_block_ops.append(
+        compilation.InvokeRegisterOp(
+            dst=true_block_result,
+            callable=tbody_reg,
+            call_args=[true_block_null],
+            tail_call=tail_call,
+            tail_position=tail_position,
+            span=span,
+        )
     )
-    true_block_ops.append(true_block_result_op)
     true_block = compilation.TreeIRBlock(
         ops=true_block_ops, ctxt=block.ctxt, inlining_stack=block.inlining_stack
     )
@@ -1461,15 +1458,16 @@ def compile_intrinsic__if_then_else_(
         compilation.LiteralOp(dst=false_block_null, value=NullValue(), span=span)
     )
     false_block_result = compiler.allocate_virtual_reg()
-    false_block_result_op = compilation.InvokeRegisterOp(
-        dst=false_block_result,
-        callable=fbody_reg,
-        call_args=[false_block_null],
-        tail_call=tail_call,
-        tail_position=tail_position,
-        span=span,
+    false_block_ops.append(
+        compilation.InvokeRegisterOp(
+            dst=false_block_result,
+            callable=fbody_reg,
+            call_args=[false_block_null],
+            tail_call=tail_call,
+            tail_position=tail_position,
+            span=span,
+        )
     )
-    false_block_ops.append(false_block_result_op)
     false_block = compilation.TreeIRBlock(
         ops=false_block_ops, ctxt=block.ctxt, inlining_stack=block.inlining_stack
     )

@@ -239,8 +239,9 @@ class BaseInvokeOp(IROp):
     tail_position: bool
 
     def __post_init__(self):
-        # Require a destination register, even if tail-call. This simplifies matters, and
-        # extra registers will be removed later via dead code elimination.
+        # Require a destination register, even if tail-call. This is for a couple reasons:
+        # - Multimethod dispatch ops must have a destination in case of dispatch failure.
+        # - Other invocations may get inlined, which means that they are no longer tail calls at all.
         assert self.dst is not None
 
 
@@ -1194,6 +1195,8 @@ class Compiler:
                             span=op.span,
                         )
                     )
+                    # Note that even if a tail call, code after may still be reachable, for instance
+                    # if the method invocation gets inlined (and so is no longer a tail call).
 
                 # Add more sub-blocks for the 'dispatch failed' cases.
                 no_matching_method = TreeIRBlock(
@@ -1242,7 +1245,7 @@ class Compiler:
                     )
                 )
 
-                if op.dst and method_results:
+                if op.dst:
                     # Re-use the old invoke op's destination register so that downstream consumers
                     # still get a value available in this register.
                     block.ops.append(
@@ -2015,7 +2018,7 @@ class Compiler:
                         options.append(pred)
             assert (
                 len(options) == 1
-            ), f"got multiple options: src={src.id}, dst={dst.id}, options->[{', '.join(str(option.id) for option in options)}]"
+            ), f"got zero or multiple options: src={src.id}, dst={dst.id}, options->[{', '.join(str(option.id) for option in options)}]"
             return options[0]
 
         # print_basic_blocks(self.basic_blocks)
