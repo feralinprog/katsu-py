@@ -2759,14 +2759,20 @@ class Compiler:
             lr_op_fixups.append(block)
             return -len(lr_op_fixups)
 
-        def copy_to_phis(block: BasicIRBlock, successor: BasicIRBlock, span: SourceSpan):
+        def phi_remapping(block: BasicIRBlock, successor: BasicIRBlock) -> dict[Register, Register]:
             assert successor in block.outgoing
+            remapping = {}
             for op in successor.ops:
                 if not isinstance(op, BasicBlockPhiOp):
                     continue
                 for reg, src_block in op.srcs:
                     if src_block == block:
-                        add_lr_op(CopyLROp(dst=op.dst, src=reg, span=span))
+                        remapping[reg] = op.dst
+            return remapping
+
+        def copy_to_phis(block: BasicIRBlock, successor: BasicIRBlock, span: SourceSpan):
+            for src, dst in phi_remapping(block, successor).items():
+                add_lr_op(CopyLROp(dst=dst, src=src, span=span))
 
         assert not self.lr_blocks
         assert not self.entry_lr_block
@@ -2775,6 +2781,14 @@ class Compiler:
             lr_block = LRBlock(id=len(self.lr_blocks), ops=[], incoming=set(), outgoing=set())
             self.lr_blocks.append(lr_block)
             basic_block_to_lr_block[block] = lr_block
+
+            if isinstance(block.ops[-1], BasicBlockJumpOp):
+                dst_remapping = phi_remapping(block, block.ops[-1].target)
+            else:
+                dst_remapping = {}
+
+            def phi_map(reg):
+                return dst_remapping.get(reg, reg)
 
             def add_lr_op(op: LROp):
                 assert isinstance(op, LROp)
@@ -2785,13 +2799,13 @@ class Compiler:
                 if isinstance(op, UnreachableOp):
                     raise AssertionError("shouldn't get unreachable op here")
                 elif isinstance(op, CopyOp):
-                    add_lr_op(CopyLROp(dst=op.dst, src=op.src, span=op.span))
+                    add_lr_op(CopyLROp(dst=phi_map(op.dst), src=op.src, span=op.span))
                 elif isinstance(op, BasicBlockPhiOp):
                     # Actually, do nothing here. Must be handled already by copy_to_phis() in
                     # our predecessor blocks.
                     pass
                 elif isinstance(op, LiteralOp):
-                    add_lr_op(LiteralLROp(dst=op.dst, value=op.value, span=op.span))
+                    add_lr_op(LiteralLROp(dst=phi_map(op.dst), value=op.value, span=op.span))
                 elif isinstance(
                     op, (InvokeRegisterOp, InvokeMultimethodOp, InvokeIntrinsicOp, InvokeNativeOp)
                 ):
@@ -2837,31 +2851,34 @@ class Compiler:
                         raise AssertionError("shouldn't get here")
                     if not op.tail_call:
                         if op.dst:
-                            add_lr_op(PopLROp(dst=op.dst, span=op.span))
+                            add_lr_op(PopLROp(dst=phi_map(op.dst), span=op.span))
                         else:
                             add_lr_op(DropLROp(span=op.span))
                 elif isinstance(op, ClosureOp):
-                    add_lr_op(ClosureLROp(dst=op.dst, quote=op.quote, span=op.span))
+                    add_lr_op(ClosureLROp(dst=phi_map(op.dst), quote=op.quote, span=op.span))
                 elif isinstance(op, SlotLookupOp):
-                    add_lr_op(SlotLookupLROp(dst=op.dst, slot_name=op.slot_name, span=op.span))
+                    add_lr_op(
+                        SlotLookupLROp(dst=phi_map(op.dst), slot_name=op.slot_name, span=op.span)
+                    )
                 elif isinstance(op, VectorOp):
-                    add_lr_op(VectorLROp(dst=op.dst, components=op.components, span=op.span))
+                    add_lr_op(
+                        VectorLROp(dst=phi_map(op.dst), components=op.components, span=op.span)
+                    )
                 elif isinstance(op, TupleOp):
-                    add_lr_op(VectorLROp(dst=op.dst, components=op.components, span=op.span))
+                    add_lr_op(
+                        VectorLROp(dst=phi_map(op.dst), components=op.components, span=op.span)
+                    )
                 elif isinstance(op, SignalOp):
                     add_lr_op(
                         SignalLROp(
-                            dst=op.dst,
+                            dst=phi_map(op.dst),
                             condition_name=op.condition_name,
                             signal_args=op.signal_args,
                             span=op.span,
                         )
                     )
                 elif isinstance(op, BasicBlockJumpOp):
-                    # TODO: ideally in this case we don't need to add copy ops, since we could have
-                    # just remapped the originating ops' destinations according to what we would
-                    # otherwise copy here.
-                    copy_to_phis(block, op.target, span=op.span)
+                    # We don't need to copy_to_phis() here; this was already handled with dst_remapping.
                     add_lr_op(JumpLROp(target=gen_jump(op.target), span=op.span))
                 elif isinstance(op, ReturnOp):
                     add_lr_op(ReturnLROp(src=op.value, span=op.span))
@@ -2883,26 +2900,48 @@ class Compiler:
                         )
                     )
                     for method, method_block in op.dispatch:
+                        requires_phi_copies = bool(phi_remapping(block, method_block))
                         dispatch_op.dispatch.append(
                             (
                                 [method.param_matchers[i] for i in keep_indices],
-                                len(lr_block.ops),
+                                (
+                                    len(lr_block.ops)
+                                    if requires_phi_copies
+                                    else gen_jump(method_block)
+                                ),
                             )
                         )
-                        copy_to_phis(block, method_block, span=op.span)
-                        add_lr_op(JumpLROp(target=gen_jump(method_block), span=op.span))
+                        if requires_phi_copies:
+                            copy_to_phis(block, method_block, span=op.span)
+                            add_lr_op(JumpLROp(target=gen_jump(method_block), span=op.span))
 
                     if op.no_matching_method:
-                        dispatch_op.no_matching_method = len(lr_block.ops)
-                        copy_to_phis(block, op.no_matching_method, span=op.span)
-                        add_lr_op(JumpLROp(target=gen_jump(op.no_matching_method), span=op.span))
+                        requires_phi_copies = bool(phi_remapping(block, op.no_matching_method))
+                        dispatch_op.no_matching_method = (
+                            len(lr_block.ops)
+                            if requires_phi_copies
+                            else gen_jump(op.no_matching_method)
+                        )
+                        if requires_phi_copies:
+                            copy_to_phis(block, op.no_matching_method, span=op.span)
+                            add_lr_op(
+                                JumpLROp(target=gen_jump(op.no_matching_method), span=op.span)
+                            )
 
                     if op.ambiguous_method_resolution:
-                        dispatch_op.ambiguous_method_resolution = len(lr_block.ops)
-                        copy_to_phis(block, op.ambiguous_method_resolution, span=op.span)
-                        add_lr_op(
-                            JumpLROp(target=gen_jump(op.ambiguous_method_resolution), span=op.span)
+                        requires_phi_copies = bool(phi_remapping(block, op.no_matching_method))
+                        dispatch_op.ambiguous_method_resolution = (
+                            len(lr_block.ops)
+                            if requires_phi_copies
+                            else gen_jump(op.ambiguous_method_resolution)
                         )
+                        if requires_phi_copies:
+                            copy_to_phis(block, op.ambiguous_method_resolution, span=op.span)
+                            add_lr_op(
+                                JumpLROp(
+                                    target=gen_jump(op.ambiguous_method_resolution), span=op.span
+                                )
+                            )
                 elif isinstance(op, BasicBlockIfElseOp):
                     # if not <condition> goto F
                     # copy into phi nodes for <true-block>
@@ -2910,26 +2949,43 @@ class Compiler:
                     # F:
                     # copy into phi nodes for <false-block>
                     # goto <false-block>
+                    false_requires_phi_copies = bool(phi_remapping(block, op.false_block))
                     conditional_jump = add_lr_op(
                         ConditionalJumpLROp(
-                            condition=op.condition, match=False, target=-1, span=op.span
+                            condition=op.condition,
+                            match=False,
+                            target=(-1 if false_requires_phi_copies else gen_jump(op.false_block)),
+                            span=op.span,
                         )
                     )
                     copy_to_phis(block, op.true_block, span=op.span)
                     add_lr_op(JumpLROp(target=gen_jump(op.true_block), span=op.span))
-                    conditional_jump.target = len(lr_block.ops)
-                    copy_to_phis(block, op.false_block, span=op.span)
-                    add_lr_op(JumpLROp(target=gen_jump(op.false_block), span=op.span))
+                    if false_requires_phi_copies:
+                        conditional_jump.target = len(lr_block.ops)
+                        copy_to_phis(block, op.false_block, span=op.span)
+                        add_lr_op(JumpLROp(target=gen_jump(op.false_block), span=op.span))
                 else:
                     raise AssertionError(f"forgot an IROp: {type(op)}")
 
         # Fix up jump targets.
+        def fixup_target(target: Optional[Union[int, LRBlock]]):
+            if isinstance(target, int) and target < 0:
+                return basic_block_to_lr_block[lr_op_fixups[-target - 1]]
+            return target
+
         for block in self.lr_blocks:
             for op in block.ops:
-                if not isinstance(op, JumpLROp):
-                    continue
-                if op.target < 0:
-                    op.target = basic_block_to_lr_block[lr_op_fixups[-op.target - 1]]
+                if isinstance(op, (JumpLROp, ConditionalJumpLROp)):
+                    op.target = fixup_target(op.target)
+                elif isinstance(op, MultimethodDispatchLROp):
+                    op.dispatch = [
+                        (matchers, fixup_target(target)) for matchers, target in op.dispatch
+                    ]
+                    op.no_matching_method = fixup_target(op.no_matching_method)
+                    op.ambiguous_method_resolution = fixup_target(op.ambiguous_method_resolution)
+                else:
+                    # Nothing to fix up.
+                    pass
 
         # Add other graph information to the LR blocks.
         self.entry_lr_block = basic_block_to_lr_block[self.entry_basic_block]
