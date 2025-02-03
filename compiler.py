@@ -687,6 +687,7 @@ class Compiler:
     entry_lr_block: Optional[LRBlock]
 
     low_level_bytecode: list[LROp]
+    frame_reg_count: int
 
     # Internal use only.
     def __init__(self, ir):
@@ -701,6 +702,7 @@ class Compiler:
         self.lr_blocks = []
         self.entry_lr_block = None
         self.low_level_bytecode = []
+        self.frame_reg_count = -1
 
     # Add an IR operation, and return the destination register (for convenience).
     def add_ir_op(self, block: TreeIRBlock, op: IROp) -> Optional[Register]:
@@ -959,9 +961,9 @@ class Compiler:
             print(colored("compiling to low level blocks:", "red"))
             self.compile_to_low_level_blocks()
             print_low_level_blocks(self.lr_blocks)
-            # print(colored("linearizing to low level bytecode:", "red"))
-            # self.compile_to_low_level_bytecode()
-            # print_low_level_bytecode(self.low_level_bytecode)
+            print(colored("linearizing to low level bytecode:", "red"))
+            self.compile_to_low_level_bytecode()
+            print_low_level_bytecode(self.low_level_bytecode)
 
             print(colored("~~~~~~~~~ COMPILATION PROCESS END ~~~~~~~~~~~~", "grey"))
         except Exception as e:
@@ -2935,6 +2937,173 @@ class Compiler:
             lr_block = basic_block_to_lr_block[block]
             lr_block.incoming = set(basic_block_to_lr_block[pred] for pred in block.incoming)
             lr_block.outgoing = set(basic_block_to_lr_block[succ] for succ in block.outgoing)
+
+    def compile_to_low_level_bytecode(self) -> None:
+        assert not self.low_level_bytecode
+
+        # TODO:
+        # - linearize (and do some small optimizations to delete unnecessary jumps)
+
+        # First figure out the order in which to lay down the LR blocks. Do a depth-first
+        # search generally so that linear chains and loops have constituent blocks placed
+        # near each other.
+        seen = set()
+        linearization = []
+        work = [self.entry_lr_block]
+        while work:
+            block, work = work[0], work[1:]
+            if block in seen:
+                continue
+            seen.add(block)
+            linearization.append(block)
+            # TODO: could sort these too. For instance make sure to search 'happy path'
+            # (multimethod dispatch as opposed to no-matching-method error path) and also
+            # true block before false block for if/else.
+            work.extend(list(block.outgoing))
+
+        # Now that we know the linearization ordering on LR blocks, we can start placing actual
+        # ops. We can prune jumps which occur at the end of an LR block and which point at the
+        # next LR block.
+
+        # Keep track of where the start of each block is.
+        lr_block_to_position = {}
+
+        for i, block in enumerate(linearization):
+            not_last_block = i < len(linearization) - 1
+            lr_block_to_position[block] = len(self.low_level_bytecode)
+            self.low_level_bytecode.extend(block.ops)
+            last_op = self.low_level_bytecode[-1]
+            if (
+                isinstance(last_op, JumpLROp)
+                and not_last_block
+                and last_op.target == linearization[i + 1]
+            ):
+                self.low_level_bytecode = self.low_level_bytecode[:-1]
+
+        # Now, remap all jumps to refer to op indices as opposed to LR blocks themselves.
+        def fixup_target(target: Optional[Union[int, LRBlock]]):
+            if isinstance(target, LRBlock):
+                return lr_block_to_position[target]
+            return target
+
+        for op in self.low_level_bytecode:
+            if isinstance(op, (JumpLROp, ConditionalJumpLROp)):
+                op.target = fixup_target(op.target)
+            elif isinstance(op, MultimethodDispatchLROp):
+                op.dispatch = [(matchers, fixup_target(target)) for matchers, target in op.dispatch]
+                op.no_matching_method = fixup_target(op.no_matching_method)
+                op.ambiguous_method_resolution = fixup_target(op.ambiguous_method_resolution)
+            else:
+                # Nothing to fix up.
+                pass
+
+        # For now, we do the simplest / dumbest possible register allocation -- just assign a new
+        # register per virtual-register. (So this is really just register renaming, not allocation.)
+        # It should work for now, though is of course not optimal.
+        # TODO:
+        # - find live ranges for virtual registers
+        # - allocate "machine" registers (these are really just slots in a call frame, and
+        #   we cannot run out -- we just need to figure out how many are required)
+
+        reg_map = {}
+
+        def alloc_reg(reg):
+            if reg not in reg_map:
+                reg_map[reg] = VirtualRegister(len(reg_map))
+
+        # First do a pass to collect destination registers (and allocate fresh registers for them).
+        for op in self.low_level_bytecode:
+            if isinstance(op, CopyLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, LiteralLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, PushLROp):
+                pass
+            elif isinstance(op, PopLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, DropLROp):
+                pass
+            elif isinstance(op, InvokeRegisterLROp):
+                pass
+            elif isinstance(op, InvokeMultimethodLROp):
+                pass
+            elif isinstance(op, InvokeIntrinsicLROp):
+                pass
+            elif isinstance(op, InvokeNativeLROp):
+                pass
+            elif isinstance(op, ClosureLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, SlotLookupLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, VectorLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, TupleLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, SignalLROp):
+                alloc_reg(op.dst)
+            elif isinstance(op, JumpLROp):
+                pass
+            elif isinstance(op, ReturnLROp):
+                pass
+            elif isinstance(op, ConditionalJumpLROp):
+                pass
+            elif isinstance(op, MultimethodDispatchLROp):
+                pass
+            else:
+                raise AssertionError(f"unknown lr-op {op}")
+
+        self.frame_reg_count = len(reg_map)
+
+        # Then do a pass to remap all register usages (source and destination).
+        def map(reg: Register) -> Register:
+            if isinstance(reg, VirtualRegister):
+                return reg_map[reg]
+            else:
+                return reg
+
+        for op in self.low_level_bytecode:
+            if isinstance(op, CopyLROp):
+                op.dst = map(op.dst)
+                op.src = map(op.src)
+            elif isinstance(op, LiteralLROp):
+                op.dst = map(op.dst)
+            elif isinstance(op, PushLROp):
+                op.src = map(op.src)
+            elif isinstance(op, PopLROp):
+                op.dst = map(op.dst)
+            elif isinstance(op, DropLROp):
+                pass
+            elif isinstance(op, InvokeRegisterLROp):
+                op.callable = map(op.callable)
+            elif isinstance(op, InvokeMultimethodLROp):
+                pass
+            elif isinstance(op, InvokeIntrinsicLROp):
+                pass
+            elif isinstance(op, InvokeNativeLROp):
+                pass
+            elif isinstance(op, ClosureLROp):
+                op.dst = map(op.dst)
+            elif isinstance(op, SlotLookupLROp):
+                op.dst = map(op.dst)
+            elif isinstance(op, VectorLROp):
+                op.dst = map(op.dst)
+                op.components = [map(comp) for comp in op.components]
+            elif isinstance(op, TupleLROp):
+                op.dst = map(op.dst)
+                op.components = [map(comp) for comp in op.components]
+            elif isinstance(op, SignalLROp):
+                op.dst = map(op.dst)
+                op.signal_args = [map(comp) for comp in op.signal_args]
+            elif isinstance(op, JumpLROp):
+                pass
+            elif isinstance(op, ReturnLROp):
+                op.src = map(op.src)
+            elif isinstance(op, ConditionalJumpLROp):
+                op.condition = map(op.condition)
+            elif isinstance(op, MultimethodDispatchLROp):
+                op.dispatch_args = [map(arg) for arg in op.dispatch_args]
+            else:
+                raise AssertionError(f"unknown lr-op {op}")
 
 
 should_show_compiler_output = False
