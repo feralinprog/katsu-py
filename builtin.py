@@ -254,7 +254,7 @@ def declare_method(
             else:
                 raise ValueError(f"Unknown method attribute: '{attr}'.")
 
-    compiled_body = CompiledBody(body.body, bytecode=None, comp_ctxt=block.ctxt, method=None)
+    compiled_body = CompiledBody(body.body, compiled=None, comp_ctxt=block.ctxt, method=None)
     method = Method(
         param_matchers=param_matchers,
         body=QuoteMethodBody(
@@ -558,7 +558,9 @@ def handle__let_eq_(
         raise ValueError(f"Slot '{local_name}' is already defined.")
     # Compile the value-expression before adding to the context, so that the value-expression cannot
     # use the local.
-    value_reg = compiler.compile_expr(block, value, tail_position=False, currently_inlining=False)
+    value_reg = compiler.compile_expr(
+        block, value, tail_position=False, currently_inlining=False, inlining_from_tail_call=False
+    )
     if value_reg:
         # TODO: if this block is part of a quote-method-body in the inlining stack, then we need to
         # add a phi op for this so that tail-recursion-to-iteration conversion can handle propagating
@@ -596,7 +598,9 @@ def handle__set(
     if not ctxt:
         raise ValueError(f"'{slot}' is not defined.")
 
-    value_reg = compiler.compile_expr(block, value, tail_position=False, currently_inlining=False)
+    value_reg = compiler.compile_expr(
+        block, value, tail_position=False, currently_inlining=False, inlining_from_tail_call=False
+    )
 
     # TODO: deal with tail-recursion inlining context.
     if isinstance(ctxt, CompilationContext):

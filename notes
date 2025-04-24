@@ -113,12 +113,12 @@ continuations and error handling:
       * call/cc but the continuation is only valid in dynamic scope of the called quote (i.e. can only return to call/cc site)
       * and finally, hard-code calling handle-signal: method on any exception
 
+call frame structure:
+* has code, current spot
+* has 
+
 TODO:
 * coroutines / fibers
-* add a bit more smarts to bytecode compiler. should have conditionals and jumps,
-  and should inline any other methods that invoke any of the call* family of methods
-  (or which request to be inlined)
-  - also delete some of the builtins which should be handled as part of compiler (let:=:, if:then:else:, etc.)?
 * literal data structure syntax?
   * %{ { key; value}; { key; value } ... }
 * modules?

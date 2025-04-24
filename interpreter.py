@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from parser import Expr
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, Optional, Union
 
 from termcolor import colored
 
@@ -315,50 +315,17 @@ class Context:
 
 
 @dataclass
-class BytecodeOp:
-    # TODO: switch to enum
-    op: str
-    # TODO: make subclasses per op for better type safety
-    args: Tuple
-    # For stack traces / debugging
-    span: SourceSpan
-
-
-@dataclass
-class JumpIndex:
-    index: int
-
-
-# List of bytecode operations:
-# get-slot <str>
-# create-slot <str>
-# push-default-receiver
-# push-value <Value>
-# push-closure <QuoteValue>
-# invoke <message: str> <nargs: int>        (nargs includes the receiver)
-# tail-invoke <message: str> <nargs: int>   (nargs includes the receiver)
-# components>vector <length: int>
-# components>tuple <length: int>
-# drop
-
-
-@dataclass
-class BytecodeSequence:
-    code: list[BytecodeOp]
-
-
-@dataclass
 class CallFrame:
     # For debug / logging.
     name: str
-    sequence: BytecodeSequence
-    # Next index to execute (or == len(sequence.code) if the next operation
-    # is to return.
+    code: list["compilation.LROp"]
+    # Next index to execute.
     spot: int
-    data_stack: list[Union[Value, Expr, Context]]
+    # Includes arguments, locals, temporaries.
+    regs: list[Optional[Value]]
+    # Just holds values pushed to / returned from invocations.
+    data_stack: list[Value]
     context: Context
-    # Receiver to use if none is explicitly provided in an invocation.
-    default_receiver: Value
     # Optional value to call when unwinding this call frame.
     cleanup: Optional[Value]
     # Is this frame the invocation of a cleanup action?
@@ -375,11 +342,11 @@ class CallFrame:
     def copy(self) -> "CallFrame":
         return CallFrame(
             name=self.name,
-            sequence=self.sequence,
+            code=self.code,
             spot=self.spot,
+            regs=list(self.regs),
             data_stack=list(self.data_stack),
             context=self.context,
-            default_receiver=self.default_receiver,
             cleanup=self.cleanup,
             is_cleanup=self.is_cleanup,
             cleanup_retain=self.cleanup_retain,
@@ -607,7 +574,7 @@ class MultiMethod:
 class CompiledBody:
     body: Expr
     # Only None if this compiled body has been invalidated or has not even been invoked yet.
-    bytecode: Optional[BytecodeSequence]
+    compiled: Optional["compilation.CompiledBytecode"]
     comp_ctxt: "compilation.CompilationContext"
     # If this body comes from a method definition (for a quote method, in particular), this links to that method.
     # TODO: this feels a bit hacky. probably need to refactor this...
@@ -619,36 +586,36 @@ class CompiledBody:
     #     self.maybe_recompile(_initial=True)
 
     def invalidate(self) -> None:
-        self.bytecode = None
+        self.compiled = None
         if compilation.should_show_compiler_output:
             print("~~~~~~~~ INVALIDATING COMPILED BODY ~~~~~~~~~~~")
             print("COMPILED BODY:", self.body)
         self.was_invalidated = True
 
-    def maybe_recompile(self) -> BytecodeSequence:
-        if not self.bytecode:
+    def maybe_recompile(self) -> "compilation.CompiledBytecode":
+        if not self.compiled:
             if self.method:
                 compiler = compilation.Compiler.compile_quote_method(self.method)
             else:
                 compiler = compilation.Compiler.compile_standalone_expr(self.comp_ctxt, self.body)
-            self.bytecode = compiler.low_level_bytecode
+            self.compiled = compiler.compilation_result()
             compilation.show_compiler_output(
                 self.body,
-                self.bytecode,
+                self.compiled,
                 compiler.multimethod_deps,
                 is_recompilation=self.was_invalidated,
             )
             for multimethod in compiler.multimethod_deps:
                 if self not in multimethod.compilations_to_invalidate:
                     multimethod.compilations_to_invalidate.append(self)
-        return self.bytecode
+        return self.compiled
 
 
 #################################################
 # Runtime Interpreter / Evaluation
 #################################################
 
-should_log_states = False
+should_log_states = True
 
 
 def debug_log_state(state: RuntimeState) -> None:
@@ -658,14 +625,10 @@ def debug_log_state(state: RuntimeState) -> None:
     print("============ RUNTIME STATE ===============")
 
     for depth, frame in enumerate(state.call_stack):
-        if frame.spot == len(frame.sequence.code):
-            location_msg = f"just after "
-            bytecode = frame.sequence.code[-1]
-        else:
-            location_msg = f"at "
-            bytecode = frame.sequence.code[frame.spot]
-        location_msg += f"{repr(bytecode.span.file.source[bytecode.span.start.index:bytecode.span.end.index])} (at {bytecode.span})"
-        print(f"call frame #{depth}: ({frame.name}) {location_msg}")
+        span = frame.code[frame.spot].span
+        print(
+            f"call frame #{depth}: ({frame.name}) at {repr(span.file.source[span.start.index:span.end.index])} (at {span})"
+        )
 
         flags = []
         if frame.is_cleanup:
@@ -679,43 +642,19 @@ def debug_log_state(state: RuntimeState) -> None:
             print(f"  return continuations returning here: {frame.num_nonlocal_returns}")
 
         print("  bytecode:")
-        for spot, bytecode in enumerate(frame.sequence.code):
-            prefix = "  -> " if spot == frame.spot else "     "
-            if bytecode.op == "multimethod-dispatch":
-                message, nargs, methods, jump_index_on_failure = bytecode.args
-
-                def matcher_str(matcher):
-                    if isinstance(matcher, ParameterAnyMatcher):
-                        return "<any>"
-                    elif isinstance(matcher, ParameterTypeMatcher):
-                        return matcher.param_type.name
-                    elif isinstance(matcher, ParameterValueMatcher):
-                        return f"eq({matcher.param_value})"
-
-                args = [
-                    message,
-                    nargs,
-                    *[
-                        f"({','.join(matcher_str(matcher) for matcher in matchers)})->{jump.index}"
-                        for matchers, jump in methods
-                    ],
-                    f"err->{jump_index_on_failure.index}",
-                ]
-            else:
-                args = bytecode.args
-            print(
-                f"{prefix} #{spot} {bytecode.op}{''.join(' ' + (repr(arg.value) if isinstance(arg, StringValue) else str(arg)) for arg in args)}"
-            )
-        if frame.spot == len(frame.sequence.code):
-            print("  -> [about to return]")
-
-        print(f"  default-receiver: {frame.default_receiver}")
+        for spot, op in enumerate(frame.code):
+            print("  -> " if spot == frame.spot else "     ", end="")
+            compilation.print_lr_op(op)
 
         print("  context:" + ("" if frame.context.base else " <global>"))
         if frame.context.base:
             context = frame.context
             print("    slots:")
             while context.base:
+                if isinstance(context, compilation.CompilationContext):
+                    print("    !! <compilation context>")
+                    context = context.base
+                    continue
                 for slot, value in context.slots.items():
                     if isinstance(value, Context):
                         value_str = "<a context> (!!!!!!)"
@@ -735,6 +674,9 @@ def debug_log_state(state: RuntimeState) -> None:
                 value_str = str(frame.cleanup_retain)
             print(f"  cleanup-action retain value: {value_str}")
 
+        print("  register storage:")
+        for i, value in enumerate(frame.regs):
+            print(f"    ({i}) {repr(value) if isinstance(value, StringValue) else str(value)}")
         print("  data stack:")
         for value in frame.data_stack:
             if isinstance(value, Context):
@@ -742,7 +684,7 @@ def debug_log_state(state: RuntimeState) -> None:
             elif isinstance(value, Expr):
                 value_str = f"<expr {value}>"
             else:
-                value_str = str(value)
+                value_str = repr(value) if isinstance(value, StringValue) else str(value)
             print(f"  >> {value_str}")
 
     if state.panic_value:
@@ -755,12 +697,22 @@ def eval_one_op(state: RuntimeState) -> None:
     assert state
     assert state.call_stack
     frame = state.call_stack[-1]
-    assert 0 <= frame.spot <= len(frame.sequence.code)
+    assert 0 <= frame.spot < len(frame.code)
     assert not (frame.is_cleanup and frame.force_unwind)
 
     debug_log_state(state)
 
-    if frame.spot == len(frame.sequence.code) or frame.force_unwind:
+    def read_reg(reg: compilation.Register) -> Value:
+        assert isinstance(reg, compilation.VirtualRegister), reg
+        return frame.regs[reg.index]
+
+    def write_reg(reg: compilation.Register, value: Value) -> None:
+        assert isinstance(reg, compilation.VirtualRegister), reg
+        frame.regs[reg.index] = value
+
+    op = frame.code[frame.spot]
+
+    if frame.force_unwind or isinstance(op, compilation.ReturnLROp):
         # Return from invocation. The current frame's top-of-data-stack holds the return value,
         # so push this to the next lower call frame's data stack. (Well, that's mostly true.
         # If the current frame is_cleanup, then the return value is held in cleanup_retain, so
@@ -799,9 +751,6 @@ def eval_one_op(state: RuntimeState) -> None:
             next_frame.data_stack.append(return_value)
 
         return
-
-    bytecode = frame.sequence.code[frame.spot]
-    op = bytecode.op
 
     def signal_error(
         condition_name: str,
@@ -844,75 +793,70 @@ def eval_one_op(state: RuntimeState) -> None:
             state, frame, signal_message, slot, nargs=2, tail_call=False, already_signaled=True
         )
 
-    def _do_invoke_method_body(
-        state, frame, message, method_body, args, tail_call, already_signaled
-    ):
+    def _do_invoke_intrinsic_handler(state, intrinsic_handler, args, tail_call, already_signaled):
+        try:
+            # Allow the intrinsic handler to take arbitrary control of the runtime. It also takes
+            # responsibility for updating the frame as necessary.
+            intrinsic_handler.handler(state, tail_call, *args)
+        except Exception as e:
+            # TODO: allow handlers to raise more targeted exceptions that already include a condition name
+            signal_error(
+                condition_name="internal-error",
+                error_message=f"error from intrinsic handler: {e}",
+                state=state,
+                source_exception=e,
+                already_signaled=already_signaled,
+            )
+
+    def _do_invoke_native_handler(state, native_handler, args, already_signaled):
+        try:
+            # handler is something which can be called with a context, receiver, and arguments.
+            # It should not call evaluation functions. (It can, but the stack is not reified and
+            # uses host language stack instead).
+            result = native_handler.handler(frame.context, *args)
+        except Exception as e:
+            # TODO: allow handlers to raise more targeted exceptions that already include a condition name
+            signal_error(
+                condition_name="internal-error",
+                error_message=f"error from builtin handler: {e}",
+                state=state,
+                source_exception=e,
+                already_signaled=already_signaled,
+            )
+            return
+        assert isinstance(
+            result, Value
+        ), f"Result from builtin handler '{native_handler}' must be a Value; got '{result}'."
+        frame.data_stack.append(result)
+        frame.spot += 1
+
+    def _do_invoke_method_body(state, message, method_body, args, tail_call, already_signaled):
         # TODO: refactor to separate methods per conditional block.
         if isinstance(method_body, QuoteMethodBody):
             # TODO: is there an earlier chance to recompile? Maybe this is fine since this only recompiles
             # if already compiled and then later invalidated...
             method_body.compiled_body.maybe_recompile()
-            body_ctxt = Context(slots={}, base=method_body.context)
-            assert len(args) == len(
-                method_body.param_names
-            ), f"{len(args)} != len({method_body.param_names})"
-            for param_name, arg in zip(method_body.param_names, args):
-                body_ctxt.slots[param_name] = arg
-
-            # TODO: use reified context as default receiver?
             invoke_compiled(
                 state,
                 message,
-                method_body.compiled_body.bytecode,
-                body_ctxt,
-                default_receiver=NullValue(),
+                method_body.compiled_body.compiled,
+                [NullValue()] + args,
+                method_body.context,
                 cleanup=None,
                 is_cleanup=False,
                 cleanup_retain=None,
                 tail_call=tail_call,
             )
         elif isinstance(method_body, IntrinsicMethodBody):
-            try:
-                handler = method_body.handler
-                # Allow the intrinsic handler to take arbitrary control of the runtime. It also takes
-                # responsibility for updating the frame as necessary.
-                handler.handler(state, tail_call, *args)
-            except Exception as e:
-                # TODO: allow handlers to raise more targeted exceptions that already include a condition name
-                signal_error(
-                    condition_name="internal-error",
-                    error_message=f"error from intrinsic handler: {e}",
-                    state=state,
-                    source_exception=e,
-                    already_signaled=already_signaled,
-                )
-                return
+            _do_invoke_intrinsic_handler(
+                state, method_body.handler, args, tail_call, already_signaled
+            )
         elif isinstance(method_body, NativeMethodBody):
             if tail_call:
                 print(
                     "WARNING: tail call requested, but could not be applied to native method body"
                 )
-            try:
-                handler = method_body.handler
-                # handler is something which can be called with a context, receiver, and arguments.
-                # It should not call evaluation functions. (It can, but the stack is not reified and
-                # uses host language stack instead).
-                result = handler.handler(frame.context, *args)
-            except Exception as e:
-                # TODO: allow handlers to raise more targeted exceptions that already include a condition name
-                signal_error(
-                    condition_name="internal-error",
-                    error_message=f"error from builtin handler: {e}",
-                    state=state,
-                    source_exception=e,
-                    already_signaled=already_signaled,
-                )
-                return
-            assert isinstance(
-                result, Value
-            ), f"Result from builtin handler '{message}' must be a Value; got '{result}'."
-            frame.data_stack.append(result)
-            frame.spot += 1
+            _do_invoke_native_handler(state, method_body.handler, args, already_signaled)
         else:
             raise AssertionError(f"Unexpected method body '{method_body}'")
 
@@ -941,7 +885,7 @@ def eval_one_op(state: RuntimeState) -> None:
                     return
 
                 _do_invoke_method_body(
-                    state, frame, message, method.body, args, tail_call, already_signaled
+                    state, message, method.body, args, tail_call, already_signaled
                 )
             elif isinstance(slot, CompileTimeHandler):
                 raise AssertionError(
@@ -950,9 +894,56 @@ def eval_one_op(state: RuntimeState) -> None:
             else:
                 raise AssertionError(f"Unexpected slot value '{slot}'")
 
-    if op == "get-slot":
-        (slot,) = bytecode.args
-        assert isinstance(slot, str)
+    if isinstance(op, compilation.CopyLROp):
+        write_reg(op.dst, read_reg(op.src))
+        frame.spot += 1
+    elif isinstance(op, compilation.LiteralLROp):
+        write_reg(op.dst, op.value)
+        frame.spot += 1
+    elif isinstance(op, compilation.PushLROp):
+        frame.data_stack.append(read_reg(op.src))
+        frame.spot += 1
+    elif isinstance(op, compilation.PopLROp):
+        assert frame.data_stack
+        write_reg(op.dst, frame.data_stack.pop())
+        frame.spot += 1
+    elif isinstance(op, compilation.DropLROp):
+        assert frame.data_stack
+        frame.data_stack.pop()
+        frame.spot += 1
+    elif isinstance(op, compilation.InvokeRegisterLROp):
+        value = read_reg(op.callable)
+        _do_invoke(
+            state,
+            frame,
+            "<invoke-register>",
+            value,
+            op.num_args,
+            op.tail_call,
+            already_signaled=False,
+        )
+    elif isinstance(op, compilation.InvokeMultimethodLROp):
+        _do_invoke(
+            state,
+            frame,
+            op.multimethod.name,
+            op.multimethod,
+            op.num_args,
+            op.tail_call,
+            already_signaled=False,
+        )
+    elif isinstance(op, compilation.InvokeIntrinsicLROp):
+        args = frame.data_stack[len(frame.data_stack) - op.num_args :]
+        frame.data_stack = frame.data_stack[: -op.num_args]
+        _do_invoke_intrinsic_handler(state, op.intrinsic, args, already_signaled=False)
+    elif isinstance(op, compilation.InvokeNativeLROp):
+        args = frame.data_stack[len(frame.data_stack) - op.num_args :]
+        frame.data_stack = frame.data_stack[: -op.num_args]
+        _do_invoke_native_handler(state, op.native, args, already_signaled=False)
+    elif isinstance(op, compilation.ClosureLROp):
+        raise NotImplementedError("ClosureLROp")
+    elif isinstance(op, compilation.SlotLookupLROp):
+        slot = op.slot_name
         # Find the slot value:
         ctxt = frame.context
         value = None
@@ -962,242 +953,283 @@ def eval_one_op(state: RuntimeState) -> None:
                 break
             ctxt = ctxt.base
         assert value, "compilation issue?"
-        frame.data_stack.append(value)
+        write_reg(op.dst, value)
         frame.spot += 1
-    elif op == "create-slot":
-        (slot,) = bytecode.args
-        assert isinstance(slot, str)
-        assert slot not in frame.context.slots, "compilation issue?"
-        assert frame.data_stack
-        # TODO: often this will be followed by a 'drop'; peephole optimize?
-        frame.context.slots[slot] = frame.data_stack[-1]
+    elif isinstance(op, compilation.VectorLROp):
+        write_reg(op.dst, VectorValue(components=[read_reg(comp) for comp in op.components]))
         frame.spot += 1
-    elif op == "push-default-receiver":
-        assert not bytecode.args
-        frame.data_stack.append(frame.default_receiver)
+    elif isinstance(op, compilation.TupleLROp):
+        write_reg(op.dst, TupleValue(components=[read_reg(comp) for comp in op.components]))
         frame.spot += 1
-    elif op == "push-value":
-        (v,) = bytecode.args
-        assert isinstance(v, Value)
-        frame.data_stack.append(v)
-        frame.spot += 1
-    elif op == "push-closure":
-        (quote,) = bytecode.args
-        assert isinstance(quote, QuoteValue)
-        assert quote.context is None
-        closure = QuoteValue(
-            parameters=quote.parameters,
-            compiled_body=quote.compiled_body,
-            context=frame.context,
-            span=quote.span,
-        )
-        frame.data_stack.append(closure)
-        frame.spot += 1
-    elif op == "multimethod-dispatch":
-        # `methods` is not really methods, just (param-matchers, jump-index) pairs.
-        message, nargs, methods, jump_index_on_failure = bytecode.args
-        assert isinstance(message, str)
-        assert isinstance(nargs, int)
-        assert nargs > 0
-        assert len(frame.data_stack) >= nargs
-        for matchers, jump_index in methods:
-            assert len(matchers) == nargs
-            for matcher in matchers:
-                assert isinstance(matcher, ParameterMatcher)
-            assert isinstance(jump_index, JumpIndex)
-            assert 0 <= jump_index.index <= len(frame.sequence.code)
-        assert isinstance(jump_index_on_failure, JumpIndex)
-        assert 0 <= jump_index_on_failure.index <= len(frame.sequence.code)
-
-        # Note: args includes the receiver.
-        args = frame.data_stack[len(frame.data_stack) - nargs :]
-        # Don't pop the args; the method body expects to use them.
-
-        # Assumes / requires that the dispatch options are already sorted in an order where we can
-        # just do a linear scan.
-        options = []
-        for method in methods:
-            param_matchers, _ = method
-            if all(matcher.matches(arg) for arg, matcher in zip(args, param_matchers)):
-                options.append(method)
-        if len(options) == 1:
-            _, jump_index = options[0]
-            frame.spot = jump_index.index
-        elif len(options) == 0:
-            # TODO: this is hacky; the `- 1` is to handle signal_error() ----> call_impl() eventually shifting the frame over.
-            # Probably need to update shifting to properly support success/failure shifting per bytecode.
-            frame.spot = jump_index_on_failure.index - 1
-            signal_error(
-                condition_name="no-matching-method",
-                error_message=f"No matching method found for multi-method {message} "
-                f"with values: {', '.join(str(arg) for arg in args)}.",
-                state=state,
-                source_exception=None,
-                already_signaled=False,
-            )
+    elif isinstance(op, compilation.SignalLROp):
+        raise NotImplementedError("SignalLROp")
+    elif isinstance(op, compilation.JumpLROp):
+        frame.spot = op.target
+    elif isinstance(op, compilation.ReturnLROp):
+        raise AssertionError("shouldn't get here, should be handled above")
+    elif isinstance(op, compilation.ConditionalJumpLROp):
+        cond_value = read_reg(op.condition)
+        assert isinstance(cond_value, BoolValue)
+        if cond_value.value == op.match:
+            frame.spot = op.target
         else:
-            # Determine if there is a single most-specific option. Otherwise the resolution is
-            # ambiguous.
-            # Note that the methods is pre-sorted to allow these comparisons.
-            candidate = min(options, key=methods.index)
-            candidate_matchers, jump_index = candidate
-            if all(
-                all(matcher_lte(ma, mb) for ma, mb in zip(candidate_matchers, option_matchers))
-                for option_matchers, _ in options
-            ):
-                frame.spot = jump_index.index
-                return
-            # TODO: this is hacky; the `- 1` is to handle signal_error() ----> call_impl() eventually shifting the frame over.
-            # Probably need to update shifting to properly support success/failure shifting per bytecode.
-            frame.spot = jump_index_on_failure.index - 1
-            signal_error(
-                condition_name="ambiguous-method-resolution",
-                error_message=f"There were multiple matching methods found for multi-method {message} "
-                f"with values: {', '.join(str(arg) for arg in args)}.",
-                state=state,
-                source_exception=None,
-                already_signaled=False,
-            )
-    elif op == "invoke" or op == "tail-invoke":
-        message, nargs = bytecode.args
-        assert isinstance(message, str)
-        assert isinstance(nargs, int)
-        assert nargs > 0
-        assert len(frame.data_stack) >= nargs
-
-        tail_call = op == "tail-invoke"
-
-        # Find the slot value:
-        ctxt = frame.context
-        slot = None
-        while ctxt is not None:
-            if message in ctxt.slots:
-                slot = ctxt.slots[message]
-                break
-            ctxt = ctxt.base
-        if not slot:
-            signal_error(
-                condition_name="undefined-slot",
-                error_message=f"Could not invoke '{message}'; slot is not defined.",
-                state=state,
-                source_exception=None,
-                already_signaled=False,
-            )
-            return
-
-        _do_invoke(state, frame, message, slot, nargs, tail_call, already_signaled=False)
-    elif op == "invoke-quote" or op == "tail-invoke-quote":
-        message, method_body, nargs = bytecode.args
-        assert isinstance(message, str)
-        assert isinstance(method_body, QuoteMethodBody)
-        assert isinstance(nargs, int)
-        assert nargs > 0
-        assert len(frame.data_stack) >= nargs
-
-        tail_call = op == "tail-invoke-quote"
-
-        # Note: args includes the receiver.
-        args = frame.data_stack[len(frame.data_stack) - nargs :]
-        frame.data_stack = frame.data_stack[:-nargs]
-
-        _do_invoke_method_body(
-            state, frame, message, method_body, args, tail_call, already_signaled=False
-        )
-    elif op == "invoke-intrinsic" or op == "tail-invoke-intrinsic":
-        message, intrinsic_handler, nargs = bytecode.args
-        assert isinstance(message, str)
-        assert isinstance(intrinsic_handler, IntrinsicHandler)
-        assert isinstance(nargs, int)
-        assert nargs > 0
-        assert len(frame.data_stack) >= nargs
-
-        tail_call = op == "tail-invoke-intrinsic"
-
-        # Note: args includes the receiver.
-        args = frame.data_stack[len(frame.data_stack) - nargs :]
-        frame.data_stack = frame.data_stack[:-nargs]
-
-        _do_invoke_method_body(
-            state,
-            frame,
-            message,
-            IntrinsicMethodBody(intrinsic_handler, compile_inline=None),
-            args,
-            tail_call,
-            already_signaled=False,
-        )
-    elif op == "invoke-native" or op == "tail-invoke-native":
-        message, native_handler, nargs = bytecode.args
-        assert isinstance(message, str)
-        assert isinstance(native_handler, NativeHandler)
-        assert isinstance(nargs, int)
-        assert nargs > 0
-        assert len(frame.data_stack) >= nargs
-
-        tail_call = op == "tail-invoke-native"
-
-        # Note: args includes the receiver.
-        args = frame.data_stack[len(frame.data_stack) - nargs :]
-        frame.data_stack = frame.data_stack[:-nargs]
-
-        _do_invoke_method_body(
-            state,
-            frame,
-            message,
-            NativeMethodBody(native_handler),
-            args,
-            tail_call,
-            already_signaled=False,
-        )
-    elif op == "components>vector":
-        (length,) = bytecode.args
-        assert isinstance(length, int)
-        assert 0 <= length <= len(frame.data_stack)
-        components = frame.data_stack[len(frame.data_stack) - length :]
-        frame.data_stack = frame.data_stack[: len(frame.data_stack) - length]
-        frame.data_stack.append(VectorValue(components))
-        frame.spot += 1
-    elif op == "components>tuple":
-        (length,) = bytecode.args
-        assert isinstance(length, int)
-        assert 0 <= length <= len(frame.data_stack)
-        components = frame.data_stack[len(frame.data_stack) - length :]
-        frame.data_stack = frame.data_stack[: len(frame.data_stack) - length]
-        frame.data_stack.append(TupleValue(components))
-        frame.spot += 1
-    elif op == "drop":
-        assert not bytecode.args
-        frame.data_stack.pop()
-        frame.spot += 1
-    elif op == "jump":
-        (jump_index,) = bytecode.args
-        assert isinstance(jump_index, JumpIndex)
-        assert 0 <= jump_index.index <= len(frame.sequence.code)
-        frame.spot = jump_index.index
-    elif op == "push-context":
-        assert not bytecode.args
-        frame.context = Context(slots={}, base=frame.context)
-        frame.spot += 1
-    elif op == "pop-context":
-        assert not bytecode.args
-        assert frame.context.base
-        frame.context = frame.context.base
-        frame.spot += 1
+            frame.spot += 1
+    elif isinstance(op, compilation.MultimethodDispatchLROp):
+        raise NotImplementedError("MultimethodDispatchLROp")
     else:
-        raise AssertionError(f"Forgot a bytecode op! {op}")
+        raise AssertionError(f"unknown op {op}")
+
+    # if op == "get-slot":
+    #    (slot,) = bytecode.args
+    #    assert isinstance(slot, str)
+    #    # Find the slot value:
+    #    ctxt = frame.context
+    #    value = None
+    #    while ctxt is not None:
+    #        if slot in ctxt.slots:
+    #            value = ctxt.slots[slot]
+    #            break
+    #        ctxt = ctxt.base
+    #    assert value, "compilation issue?"
+    #    frame.data_stack.append(value)
+    #    frame.spot += 1
+    # elif op == "create-slot":
+    #    (slot,) = bytecode.args
+    #    assert isinstance(slot, str)
+    #    assert slot not in frame.context.slots, "compilation issue?"
+    #    assert frame.data_stack
+    #    # TODO: often this will be followed by a 'drop'; peephole optimize?
+    #    frame.context.slots[slot] = frame.data_stack[-1]
+    #    frame.spot += 1
+    # elif op == "push-default-receiver":
+    #    assert not bytecode.args
+    #    frame.data_stack.append(frame.default_receiver)
+    #    frame.spot += 1
+    # elif op == "push-value":
+    #    (v,) = bytecode.args
+    #    assert isinstance(v, Value)
+    #    frame.data_stack.append(v)
+    #    frame.spot += 1
+    # elif op == "push-closure":
+    #    (quote,) = bytecode.args
+    #    assert isinstance(quote, QuoteValue)
+    #    assert quote.context is None
+    #    closure = QuoteValue(
+    #        parameters=quote.parameters,
+    #        compiled_body=quote.compiled_body,
+    #        context=frame.context,
+    #        span=quote.span,
+    #    )
+    #    frame.data_stack.append(closure)
+    #    frame.spot += 1
+    # elif op == "multimethod-dispatch":
+    #    # `methods` is not really methods, just (param-matchers, jump-index) pairs.
+    #    message, nargs, methods, jump_index_on_failure = bytecode.args
+    #    assert isinstance(message, str)
+    #    assert isinstance(nargs, int)
+    #    assert nargs > 0
+    #    assert len(frame.data_stack) >= nargs
+    #    for matchers, jump_index in methods:
+    #        assert len(matchers) == nargs
+    #        for matcher in matchers:
+    #            assert isinstance(matcher, ParameterMatcher)
+    #        assert isinstance(jump_index, JumpIndex)
+    #        assert 0 <= jump_index.index <= len(frame.code)
+    #    assert isinstance(jump_index_on_failure, JumpIndex)
+    #    assert 0 <= jump_index_on_failure.index <= len(frame.code)
+
+    #    # Note: args includes the receiver.
+    #    args = frame.data_stack[len(frame.data_stack) - nargs :]
+    #    # Don't pop the args; the method body expects to use them.
+
+    #    # Assumes / requires that the dispatch options are already sorted in an order where we can
+    #    # just do a linear scan.
+    #    options = []
+    #    for method in methods:
+    #        param_matchers, _ = method
+    #        if all(matcher.matches(arg) for arg, matcher in zip(args, param_matchers)):
+    #            options.append(method)
+    #    if len(options) == 1:
+    #        _, jump_index = options[0]
+    #        frame.spot = jump_index.index
+    #    elif len(options) == 0:
+    #        # TODO: this is hacky; the `- 1` is to handle signal_error() ----> call_impl() eventually shifting the frame over.
+    #        # Probably need to update shifting to properly support success/failure shifting per bytecode.
+    #        frame.spot = jump_index_on_failure.index - 1
+    #        signal_error(
+    #            condition_name="no-matching-method",
+    #            error_message=f"No matching method found for multi-method {message} "
+    #            f"with values: {', '.join(str(arg) for arg in args)}.",
+    #            state=state,
+    #            source_exception=None,
+    #            already_signaled=False,
+    #        )
+    #    else:
+    #        # Determine if there is a single most-specific option. Otherwise the resolution is
+    #        # ambiguous.
+    #        # Note that the methods is pre-sorted to allow these comparisons.
+    #        candidate = min(options, key=methods.index)
+    #        candidate_matchers, jump_index = candidate
+    #        if all(
+    #            all(matcher_lte(ma, mb) for ma, mb in zip(candidate_matchers, option_matchers))
+    #            for option_matchers, _ in options
+    #        ):
+    #            frame.spot = jump_index.index
+    #            return
+    #        # TODO: this is hacky; the `- 1` is to handle signal_error() ----> call_impl() eventually shifting the frame over.
+    #        # Probably need to update shifting to properly support success/failure shifting per bytecode.
+    #        frame.spot = jump_index_on_failure.index - 1
+    #        signal_error(
+    #            condition_name="ambiguous-method-resolution",
+    #            error_message=f"There were multiple matching methods found for multi-method {message} "
+    #            f"with values: {', '.join(str(arg) for arg in args)}.",
+    #            state=state,
+    #            source_exception=None,
+    #            already_signaled=False,
+    #        )
+    # elif op == "invoke" or op == "tail-invoke":
+    #    message, nargs = bytecode.args
+    #    assert isinstance(message, str)
+    #    assert isinstance(nargs, int)
+    #    assert nargs > 0
+    #    assert len(frame.data_stack) >= nargs
+
+    #    tail_call = op == "tail-invoke"
+
+    #    # Find the slot value:
+    #    ctxt = frame.context
+    #    slot = None
+    #    while ctxt is not None:
+    #        if message in ctxt.slots:
+    #            slot = ctxt.slots[message]
+    #            break
+    #        ctxt = ctxt.base
+    #    if not slot:
+    #        signal_error(
+    #            condition_name="undefined-slot",
+    #            error_message=f"Could not invoke '{message}'; slot is not defined.",
+    #            state=state,
+    #            source_exception=None,
+    #            already_signaled=False,
+    #        )
+    #        return
+
+    #    _do_invoke(state, frame, message, slot, nargs, tail_call, already_signaled=False)
+    # elif op == "invoke-quote" or op == "tail-invoke-quote":
+    #    message, method_body, nargs = bytecode.args
+    #    assert isinstance(message, str)
+    #    assert isinstance(method_body, QuoteMethodBody)
+    #    assert isinstance(nargs, int)
+    #    assert nargs > 0
+    #    assert len(frame.data_stack) >= nargs
+
+    #    tail_call = op == "tail-invoke-quote"
+
+    #    # Note: args includes the receiver.
+    #    args = frame.data_stack[len(frame.data_stack) - nargs :]
+    #    frame.data_stack = frame.data_stack[:-nargs]
+
+    #    _do_invoke_method_body(
+    #        state, frame, message, method_body, args, tail_call, already_signaled=False
+    #    )
+    # elif op == "invoke-intrinsic" or op == "tail-invoke-intrinsic":
+    #    message, intrinsic_handler, nargs = bytecode.args
+    #    assert isinstance(message, str)
+    #    assert isinstance(intrinsic_handler, IntrinsicHandler)
+    #    assert isinstance(nargs, int)
+    #    assert nargs > 0
+    #    assert len(frame.data_stack) >= nargs
+
+    #    tail_call = op == "tail-invoke-intrinsic"
+
+    #    # Note: args includes the receiver.
+    #    args = frame.data_stack[len(frame.data_stack) - nargs :]
+    #    frame.data_stack = frame.data_stack[:-nargs]
+
+    #    _do_invoke_method_body(
+    #        state,
+    #        frame,
+    #        message,
+    #        IntrinsicMethodBody(intrinsic_handler, compile_inline=None),
+    #        args,
+    #        tail_call,
+    #        already_signaled=False,
+    #    )
+    # elif op == "invoke-native" or op == "tail-invoke-native":
+    #    message, native_handler, nargs = bytecode.args
+    #    assert isinstance(message, str)
+    #    assert isinstance(native_handler, NativeHandler)
+    #    assert isinstance(nargs, int)
+    #    assert nargs > 0
+    #    assert len(frame.data_stack) >= nargs
+
+    #    tail_call = op == "tail-invoke-native"
+
+    #    # Note: args includes the receiver.
+    #    args = frame.data_stack[len(frame.data_stack) - nargs :]
+    #    frame.data_stack = frame.data_stack[:-nargs]
+
+    #    _do_invoke_method_body(
+    #        state,
+    #        frame,
+    #        message,
+    #        NativeMethodBody(native_handler),
+    #        args,
+    #        tail_call,
+    #        already_signaled=False,
+    #    )
+    # elif op == "components>vector":
+    #    (length,) = bytecode.args
+    #    assert isinstance(length, int)
+    #    assert 0 <= length <= len(frame.data_stack)
+    #    components = frame.data_stack[len(frame.data_stack) - length :]
+    #    frame.data_stack = frame.data_stack[: len(frame.data_stack) - length]
+    #    frame.data_stack.append(VectorValue(components))
+    #    frame.spot += 1
+    # elif op == "components>tuple":
+    #    (length,) = bytecode.args
+    #    assert isinstance(length, int)
+    #    assert 0 <= length <= len(frame.data_stack)
+    #    components = frame.data_stack[len(frame.data_stack) - length :]
+    #    frame.data_stack = frame.data_stack[: len(frame.data_stack) - length]
+    #    frame.data_stack.append(TupleValue(components))
+    #    frame.spot += 1
+    # elif op == "drop":
+    #    assert not bytecode.args
+    #    frame.data_stack.pop()
+    #    frame.spot += 1
+    # elif op == "jump":
+    #    (jump_index,) = bytecode.args
+    #    assert isinstance(jump_index, JumpIndex)
+    #    assert 0 <= jump_index.index <= len(frame.code)
+    #    frame.spot = jump_index.index
+    # elif op == "push-context":
+    #    assert not bytecode.args
+    #    frame.context = Context(slots={}, base=frame.context)
+    #    frame.spot += 1
+    # elif op == "pop-context":
+    #    assert not bytecode.args
+    #    assert frame.context.base
+    #    frame.context = frame.context.base
+    #    frame.spot += 1
+    # else:
+    #    raise AssertionError(f"Forgot a bytecode op! {op}")
 
 
 def invoke_compiled(
     state: RuntimeState,
     name: str,
-    code: BytecodeSequence,
+    compiled: "compilation.CompiledBytecode",
+    args: list[Value],
     ctxt: Context,
-    default_receiver: Value,
     cleanup: Optional[Value],
     is_cleanup: bool,
     cleanup_retain: Optional[Value],
     tail_call: bool,
 ) -> None:
+    assert len(args) == compiled.num_args, (args, compiled.num_args)
+    assert compiled.num_args <= compiled.num_regs
+
     if not is_cleanup:
         assert not cleanup_retain
     assert not (cleanup and is_cleanup)
@@ -1209,9 +1241,9 @@ def invoke_compiled(
 
         if is_cleanup:
             # This could be a tail-call cleanup-action invocation.
-            assert 0 <= frame.spot <= len(frame.sequence.code)
+            assert 0 <= frame.spot <= len(frame.code)
         else:
-            assert 0 <= frame.spot < len(frame.sequence.code)
+            assert 0 <= frame.spot < len(frame.code)
 
         # Tail-call optimization! Don't tail-call if the frame has a non-local return
         # continuation active, as tail-calling would invalidate that continuation.
@@ -1220,12 +1252,12 @@ def invoke_compiled(
         # TODO: support tail-call if current frame and even next frame both have cleanup
         # actions required.
         if tail_call:
-            if frame.spot != len(frame.sequence.code) - 1 or (
+            if frame.spot != len(frame.code) - 1 or (
                 frame.is_cleanup or frame.cleanup or frame.num_nonlocal_returns > 0
             ):
                 print("WARNING: not performing tail-call even though requested")
                 print(
-                    f"details: spot={frame.spot}, codelen={len(frame.sequence.code)}, is_cleanup={frame.is_cleanup}, cleanup={frame.cleanup}, num_nonlocal_returns={frame.num_nonlocal_returns}"
+                    f"details: spot={frame.spot}, codelen={len(frame.code)}, is_cleanup={frame.is_cleanup}, cleanup={frame.cleanup}, num_nonlocal_returns={frame.num_nonlocal_returns}"
                 )
                 tail_call = False
         if tail_call:
@@ -1243,11 +1275,11 @@ def invoke_compiled(
     state.call_stack.append(
         CallFrame(
             name=name,
-            sequence=code,
+            code=compiled.code,
             spot=0,
+            regs=args + [None] * (compiled.num_regs - compiled.num_args),
             data_stack=[],
             context=ctxt,
-            default_receiver=default_receiver,
             cleanup=cleanup,
             is_cleanup=is_cleanup,
             cleanup_retain=cleanup_retain,
@@ -1259,7 +1291,7 @@ def invoke_compiled(
 
 def shift_frame(frame: CallFrame) -> None:
     frame.spot += 1
-    assert 0 <= frame.spot <= len(frame.sequence.code)
+    assert 0 <= frame.spot <= len(frame.code)
 
 
 def shift_top_frame(state: RuntimeState) -> None:
@@ -1271,34 +1303,20 @@ def shift_top_frame(state: RuntimeState) -> None:
 def eval_toplevel(expr: Expr, context: Context) -> Value:
     # TODO: the context should have a default-receiver populated...
     compiler = compilation.Compiler.compile_toplevel_expr(context, expr)
-    # TODO: delete this special case. This just blindly assumes the expression was a simple name lookup.
-    # just doing this for now in order to test out other compilation
-    assert len(compiler.basic_blocks) == 1
-    assert len(compiler.basic_blocks[0].ops) == 2
-    op = compiler.basic_blocks[0].ops[0]
-    if hasattr(op, "slot_name"):
-        return context.slots[op.slot_name]
-    else:
-        return op.value
-    bytecode = compiler.low_level_bytecode
+    compiled = compiler.compilation_result()
     compilation.show_compiler_output(
-        expr, bytecode, compiler.multimethod_deps, is_recompilation=False
+        expr, compiled, compiler.multimethod_deps, is_recompilation=False
     )
 
-    if not bytecode.code:
-        # Must have been all compile-time evaluation.
-        return NullValue()
-
     state = RuntimeState(
-        # TODO: maybe default_receiver should be a reified global context instead?
         call_stack=[
             CallFrame(
                 name="<top level>",
-                sequence=bytecode,
+                code=compiled.code,
                 spot=0,
+                regs=[None] * compiled.num_regs,
                 data_stack=[],
                 context=context,
-                default_receiver=NullValue(),
                 cleanup=None,
                 is_cleanup=False,
                 cleanup_retain=None,
@@ -1311,7 +1329,8 @@ def eval_toplevel(expr: Expr, context: Context) -> Value:
     while True:
         if len(state.call_stack) == 1:
             frame = state.call_stack[0]
-            if (frame.spot == len(frame.sequence.code) or frame.force_unwind) and not frame.cleanup:
+            op = frame.code[frame.spot]
+            if (isinstance(op, compilation.ReturnLROp) or frame.force_unwind) and not frame.cleanup:
                 break
         eval_one_op(state)
     debug_log_state(state)
@@ -1384,13 +1403,13 @@ def pprint_stacktrace(state: RuntimeState):
         if top:
             # Cursor spot has not been ratcheted past the bytecode op producing an error.
             # Log the current spot.
-            assert 0 <= frame.spot < len(frame.sequence.code)
-            show_error(msg, frame.sequence.code[frame.spot].span)
+            assert 0 <= frame.spot < len(frame.code)
+            show_error(msg, frame.code[frame.spot].span)
         else:
             # Cursor indicates the bytecode op to _return_ to; the previous op was the
             # invocation leading to the next call frame.
-            assert 0 < frame.spot <= len(frame.sequence.code)
-            show_error(msg, frame.sequence.code[frame.spot - 1].span)
+            assert 0 < frame.spot <= len(frame.code)
+            show_error(msg, frame.code[frame.spot - 1].span)
         print()
 
 
@@ -1408,6 +1427,7 @@ def intrinsic__if_then_else_(
     body = tbody if isinstance(cond, BoolValue) and cond.value else fbody
     if isinstance(body, QuoteValue):
         # TODO: use reified context as default receiver?
+        raise NotImplementedError("fix invoke_compiled invocation")
         invoke_compiled(
             state,
             "<a quote>",
@@ -1523,6 +1543,7 @@ def call_impl(
             # TODO: use reified context as default receiver?
             default_receiver = NullValue()
         new_slots = {name: value for name, value in zip(param_names, args)}
+        raise NotImplementedError("fix invoke_compiled invocation")
         invoke_compiled(
             state,
             message,

@@ -50,7 +50,8 @@
 ## (really, figure out how this can work. maybe something like:
 ## >> method: [if: cond then: body] does: (bake: [ if: cond then: body else: $null ])
 ## where :bake: replaces any instances of a `$ expr` unary operator with `expr call`)
-method: [if: (cond: Bool) then: body] does: [ TAIL-CALL: (if: cond then: body else: null) ] :: { +inline }
+method: [if: (cond: Bool) then: body] does: [ TAIL-CALL: (if: cond then: body else: [ null ]) ] :: { +inline }
+#method: [if: cond then: body] does: [ "blah" ]
 #if: 2 > 1 then: [ print: "good: 2 > 1" ]
 #if: t == f then: [ print: "bad! t == f" ] else: [ print: "good: t != f" ]
 #
@@ -71,7 +72,7 @@ method: [while: (cond: Quote) do: (body: Quote)] does: [
         body call
         TAIL-CALL: (while: cond do: body)
     ]
-] :: { +inline; +tail-recursive }
+] :: { +inline }
 
 method: [test-while] does: [
     let: i =: 10

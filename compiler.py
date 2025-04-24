@@ -18,14 +18,11 @@ from typing import Callable, Optional, Tuple, TypeAlias, TypeVar, Union
 from termcolor import colored
 
 from interpreter import (
-    BytecodeOp,
-    BytecodeSequence,
     CompiledBody,
     CompileTimeHandler,
     Context,
     IntrinsicHandler,
     IntrinsicMethodBody,
-    JumpIndex,
     Method,
     MultiMethod,
     NativeHandler,
@@ -608,7 +605,7 @@ class JumpLROp(LROp):
 
 @dataclass
 class ReturnLROp(LROp):
-    src: Register
+    pass
 
 
 @dataclass
@@ -665,6 +662,14 @@ S = TypeVar("S")
 T = TypeVar("T")
 
 
+@dataclass
+class CompiledBytecode:
+    code: list[LROp]
+    num_args: int
+    # This includes arguments and temporaries.
+    num_regs: int
+
+
 # Compiler for a specific method / quote body in a particular CompilationContext.
 class Compiler:
     ir: TreeIRBlock
@@ -687,7 +692,8 @@ class Compiler:
     entry_lr_block: Optional[LRBlock]
 
     low_level_bytecode: list[LROp]
-    frame_reg_count: int
+    frame_arg_count: int
+    frame_temporaries_count: int
 
     # Internal use only.
     def __init__(self, ir):
@@ -768,6 +774,8 @@ class Compiler:
             )
         )
 
+        compiler.frame_arg_count = 1 + len(quote.param_names)
+
         # TODO: offset slot registers (initial inputs to method) if there are already slot registers assigned?
         # e.g. if defining a method within another method.
         # method definitions outside of top level are probably totally broken right now...
@@ -828,6 +836,8 @@ class Compiler:
             )
         )
 
+        compiler.frame_arg_count = 0
+
         compiler.ir.ctxt.slots.append(
             (
                 default_receiver,
@@ -863,7 +873,11 @@ class Compiler:
 
             print(colored("initial compilation to tree IR:", "red"))
             result_reg = self.compile_expr(
-                self.ir, expr, tail_position=True, currently_inlining=False
+                self.ir,
+                expr,
+                tail_position=True,
+                currently_inlining=False,
+                inlining_from_tail_call=False,
             )
             if not result_reg:
                 result_reg = self.add_ir_op(
@@ -971,6 +985,13 @@ class Compiler:
             print(f"Error: {e}")
             raise e
 
+    def compilation_result(self) -> CompiledBytecode:
+        return CompiledBytecode(
+            code=self.low_level_bytecode,
+            num_args=self.frame_arg_count,
+            num_regs=self.frame_reg_count,
+        )
+
     def validate_cfg(self) -> None:
         # TODO: also do some global validation:
         # * single entry block
@@ -981,12 +1002,21 @@ class Compiler:
 
     # Add IROps which evaluate the given expression.
     def compile_expr(
-        self, block: TreeIRBlock, expr: Expr, tail_position: bool, currently_inlining: bool
+        self,
+        block: TreeIRBlock,
+        expr: Expr,
+        tail_position: bool,
+        currently_inlining: bool,
+        inlining_from_tail_call: bool,
     ) -> Optional[Register]:
         assert expr is not None
+        if not currently_inlining:
+            assert not inlining_from_tail_call
 
         # TODO: make this less hacky -- should be part of macro / AST rewrite system.
         tail_call = False
+        if currently_inlining and inlining_from_tail_call:
+            tail_call = tail_position
         if isinstance(expr, NAryMessageExpr) and [message.value for message in expr.messages] == [
             "TAIL-CALL"
         ]:
@@ -1054,7 +1084,11 @@ class Compiler:
                         arg_reg = default_receiver_reg
                     else:
                         arg_reg = self.compile_expr(
-                            block, arg, tail_position=False, currently_inlining=currently_inlining
+                            block,
+                            arg,
+                            tail_position=False,
+                            currently_inlining=currently_inlining,
+                            inlining_from_tail_call=inlining_from_tail_call,
                         )
                     arg_regs.append(arg_reg)
 
@@ -1105,7 +1139,9 @@ class Compiler:
                 message, [expr.target] + expr.args, tail_call=tail_call, span=expr.span
             )
         elif isinstance(expr, ParenExpr):
-            return self.compile_expr(block, expr.inner, tail_position, currently_inlining)
+            return self.compile_expr(
+                block, expr.inner, tail_position, currently_inlining, inlining_from_tail_call
+            )
         elif isinstance(expr, QuoteExpr):
             # TODO: this is where `it` default param needs to be added (or not).
             if not expr.parameters:
@@ -1124,7 +1160,7 @@ class Compiler:
             quote = QuoteValue(
                 parameters=expr.parameters,
                 compiled_body=CompiledBody(
-                    expr.body, bytecode=None, comp_ctxt=body_comp_ctxt, method=None
+                    expr.body, compiled=None, comp_ctxt=body_comp_ctxt, method=None
                 ),
                 context=None,  # will be filled in later during evaluation
                 span=expr.span,
@@ -1136,7 +1172,11 @@ class Compiler:
             component_regs = []
             for component in expr.components:
                 reg = self.compile_expr(
-                    block, component, tail_position=False, currently_inlining=currently_inlining
+                    block,
+                    component,
+                    tail_position=False,
+                    currently_inlining=currently_inlining,
+                    inlining_from_tail_call=inlining_from_tail_call,
                 )
                 # Each component should produce a result into a register... no tail calls possible here.
                 assert reg
@@ -1153,14 +1193,22 @@ class Compiler:
             for i, part in enumerate(expr.sequence):
                 part_is_tail_position = tail_position and (i == len(expr.sequence) - 1)
                 last_output = self.compile_expr(
-                    block, part, part_is_tail_position, currently_inlining=currently_inlining
+                    block,
+                    part,
+                    part_is_tail_position,
+                    currently_inlining=currently_inlining,
+                    inlining_from_tail_call=inlining_from_tail_call,
                 )
             return last_output
         elif isinstance(expr, TupleExpr):
             component_regs = []
             for component in expr.components:
                 reg = self.compile_expr(
-                    block, component, tail_position=False, currently_inlining=currently_inlining
+                    block,
+                    component,
+                    tail_position=False,
+                    currently_inlining=currently_inlining,
+                    inlining_from_tail_call=inlining_from_tail_call,
                 )
                 # Each component should produce a result into a register... no tail calls possible here.
                 assert reg
@@ -1251,7 +1299,7 @@ class Compiler:
                         signal_args=op.call_args,
                         span=op.span,
                     )
-                    ambiguous_method_resolution.ops.append(no_matching_method_signal_op)
+                    ambiguous_method_resolution.ops.append(ambiguous_method_resolution_signal_op)
                     sub_blocks.append(ambiguous_method_resolution)
                 else:
                     ambiguous_method_resolution = None
@@ -1456,6 +1504,7 @@ class Compiler:
                                 method.body.compiled_body.body,
                                 tail_position=op.tail_position,
                                 currently_inlining=True,
+                                inlining_from_tail_call=op.tail_call,
                             )
 
                             # Add the inline block!
@@ -1732,6 +1781,7 @@ class Compiler:
                             quote.compiled_body.body,
                             tail_position=op.tail_position,
                             currently_inlining=True,
+                            inlining_from_tail_call=op.tail_call,
                         )
 
                         # Add the inline block!
@@ -2194,6 +2244,8 @@ class Compiler:
         for block in reachable_blocks:
             assert not (block.outgoing & unreachable_blocks)
 
+        deleted_blocks = unreachable_blocks
+
         # Remove all the outgoing links to reachable blocks, and delete from the CFG
         for block in unreachable_blocks:
             for succ in block.outgoing:
@@ -2207,7 +2259,7 @@ class Compiler:
         unassigned_regs = set()
 
         # We already know that if there are unreachable blocks, we're going to delete those.
-        any_change = len(unreachable_blocks) > 0
+        any_change = len(deleted_blocks) > 0
 
         for block in reachable_blocks:
             beyond_tail_call = False
@@ -2244,10 +2296,17 @@ class Compiler:
         # That could have made other blocks unreachable.
         reachable_blocks = self.find_reachable_blocks()
         unreachable_blocks = set(self.basic_blocks) - reachable_blocks
+        deleted_blocks |= unreachable_blocks
+        # Remove all the outgoing links to reachable blocks, and delete from the CFG
+        for block in unreachable_blocks:
+            for succ in block.outgoing:
+                succ.incoming.remove(block)
+        for block in unreachable_blocks:
+            self.basic_blocks.remove(block)
 
         print(
             colored(
-                f"unreachable blocks: {', '.join(str(block.id) for block in unreachable_blocks)}",
+                f"deleted blocks: {', '.join(str(block.id) for block in deleted_blocks)}",
                 "cyan",
             )
         )
@@ -2881,7 +2940,8 @@ class Compiler:
                     # We don't need to copy_to_phis() here; this was already handled with dst_remapping.
                     add_lr_op(JumpLROp(target=gen_jump(op.target), span=op.span))
                 elif isinstance(op, ReturnOp):
-                    add_lr_op(ReturnLROp(src=op.value, span=op.span))
+                    add_lr_op(PushLROp(src=op.value, span=op.span))
+                    add_lr_op(ReturnLROp(span=op.span))
                 elif isinstance(op, BasicBlockMultimethodDispatchOp):
                     keep_indices = [
                         i for i in range(len(op.dispatch_args)) if op.dispatch_args[i] is not None
@@ -2929,7 +2989,9 @@ class Compiler:
                             )
 
                     if op.ambiguous_method_resolution:
-                        requires_phi_copies = bool(phi_remapping(block, op.no_matching_method))
+                        requires_phi_copies = bool(
+                            phi_remapping(block, op.ambiguous_method_resolution)
+                        )
                         dispatch_op.ambiguous_method_resolution = (
                             len(lr_block.ops)
                             if requires_phi_copies
@@ -3067,6 +3129,9 @@ class Compiler:
             if reg not in reg_map:
                 reg_map[reg] = VirtualRegister(len(reg_map))
 
+        for i in range(self.frame_arg_count):
+            alloc_reg(SlotRegister(i))
+
         # First do a pass to collect destination registers (and allocate fresh registers for them).
         for op in self.low_level_bytecode:
             if isinstance(op, CopyLROp):
@@ -3112,10 +3177,7 @@ class Compiler:
 
         # Then do a pass to remap all register usages (source and destination).
         def map(reg: Register) -> Register:
-            if isinstance(reg, VirtualRegister):
-                return reg_map[reg]
-            else:
-                return reg
+            return reg_map[reg]
 
         for op in self.low_level_bytecode:
             if isinstance(op, CopyLROp):
@@ -3153,7 +3215,7 @@ class Compiler:
             elif isinstance(op, JumpLROp):
                 pass
             elif isinstance(op, ReturnLROp):
-                op.src = map(op.src)
+                pass
             elif isinstance(op, ConditionalJumpLROp):
                 op.condition = map(op.condition)
             elif isinstance(op, MultimethodDispatchLROp):
@@ -3162,7 +3224,7 @@ class Compiler:
                 raise AssertionError(f"unknown lr-op {op}")
 
 
-should_show_compiler_output = False
+should_show_compiler_output = True
 indent_per_level = "    "
 
 
@@ -3452,6 +3514,9 @@ def print_basic_blocks(blocks: list[BasicIRBlock]):
                 "grey",
             )
         )
+    for block in blocks:
+        for i, succ in enumerate(block.outgoing):
+            print(f"{block.id} {succ.id} {i+1}")
 
 
 def print_lr_op(op: LROp):
@@ -3506,7 +3571,7 @@ def print_lr_op(op: LROp):
     elif isinstance(op, JumpLROp):
         print(f"jump {target_to_str(op.target)}")
     elif isinstance(op, ReturnLROp):
-        print(f"return {op.src}")
+        print(f"return")
     elif isinstance(op, ConditionalJumpLROp):
         print(f"jump-{'true' if op.match else 'false'} {op.condition} {target_to_str(op.target)}")
     elif isinstance(op, MultimethodDispatchLROp):
@@ -3557,6 +3622,9 @@ def print_low_level_blocks(blocks: list[LRBlock]):
                 "grey",
             )
         )
+    for block in blocks:
+        for i, succ in enumerate(block.outgoing):
+            print(f"{block.id} {succ.id} {i+1}")
 
 
 def print_low_level_bytecode(ops: list[LROp]):
@@ -3568,7 +3636,7 @@ def print_low_level_bytecode(ops: list[LROp]):
 
 def show_compiler_output(
     expr: Expr,
-    sequence: BytecodeSequence,
+    compiled: CompiledBytecode,
     multimethod_deps: list[MultiMethod],
     is_recompilation: bool,
 ):
@@ -3580,66 +3648,16 @@ def show_compiler_output(
         print("(RECOMPILATION)")
     print("INPUT EXPRESSION:", expr)
 
-    def print_op(index, bytecode, depth):
-        level = "    "
-        indent = level * depth
-
-        if depth >= 5:
-            print(indent + "(WARNING: recursion depth exceeded")
-            return
-
-        def prefix():
-            print(indent + f"{index}: {bytecode.op}", end="")
-
-        def basic_print_op():
-            prefix()
-            print("".join(" " + str(arg) for arg in bytecode.args))
-
-        if bytecode.op == "multimethod-dispatch":
-            message, nargs, methods, jump_index_on_failure = bytecode.args
-            prefix()
-            print(f" {message} {nargs}")
-            for matchers, jump in methods:
-
-                def matcher_str(matcher):
-                    if isinstance(matcher, ParameterAnyMatcher):
-                        return "<any>"
-                    elif isinstance(matcher, ParameterTypeMatcher):
-                        return matcher.param_type.name
-                    elif isinstance(matcher, ParameterValueMatcher):
-                        return f"eq({matcher.param_value})"
-
-                print(
-                    indent
-                    + level
-                    + f"->{jump.index} on match: {', '.join(matcher_str(matcher) for matcher in matchers)}"
-                )
-            print(indent + level + f"->{jump_index_on_failure.index} on failure")
-        # elif bytecode.op in ["invoke-quote", "tail-invoke-quote"]:
-        #     prefix()
-        #     message = bytecode.args[0]
-        #     quote: QuoteMethodBody = bytecode.args[1]
-        #     nargs: int = bytecode.args[2]
-        #     print(f" {message} {quote.compiled_body.body} {nargs}")
-        #     if quote.compiled_body.bytecode:
-        #         for i, c in enumerate(quote.compiled_body.bytecode.code):
-        #             print_op(i, c, depth + 1)
-        #     else:
-        #         print(indent + level + "<invalidated, needs recompilation>")
-        # elif bytecode.op == "push-closure":
-        #     basic_print_op()
-        #     quote: QuoteValue = bytecode.args[0]
-        #     if quote.compiled_body.bytecode:
-        #         for i, c in enumerate(quote.compiled_body.bytecode.code):
-        #             print_op(i, c, depth + 1)
-        #     else:
-        #         print(indent + level + "<invalidated, needs recompilation>")
-        else:
-            basic_print_op()
-
-    print("BYTECODE:")
-    for i, c in enumerate(sequence.code):
-        print_op(i, c, depth=1)
+    print(
+        "BYTECODE: ("
+        f"{compiled.num_args} arg{'' if compiled.num_args == 1 else 's'}"
+        " / "
+        f"{compiled.num_regs} reg{'' if compiled.num_regs == 1 else 's'}"
+        ")"
+    )
+    for i, op in enumerate(compiled.code):
+        print(colored(f"({i}) ", "grey"), end="")
+        print_lr_op(op)
     print("MULTIMETHOD DEPS:")
     for multimethod in multimethod_deps:
         print("  " + multimethod.name)
